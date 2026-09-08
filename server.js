@@ -17,6 +17,8 @@ const clients = new Map(); // userId -> ws
 let activeTransmitterId = null;
 let activeTransmitStartedAt = 0;
 let audioPacketCount = 0;
+let audioBytesRelayed = 0;
+let audioLogStarted = false;
 
 function isOpen(ws) {
   return ws && ws.readyState === WebSocket.OPEN;
@@ -64,6 +66,7 @@ function handleJson(ws, data) {
     ws.userId = userId;
     ws.name = String(data.name || "Anônimo").slice(0, 32);
     clients.set(userId, ws);
+    console.log(`[IDENTIFY] ${userId} -> ${ws.name} | usuários: ${clients.size}`);
 
     sendJson(ws, {
       type: "init",
@@ -97,11 +100,16 @@ function handleJson(ws, data) {
       }
       activeTransmitterId = ws.userId;
       activeTransmitStartedAt = Date.now();
+      audioPacketCount = 0;
+      audioBytesRelayed = 0;
+      audioLogStarted = false;
+      console.log(`[TX START] ${ws.userId} (${ws.name})`);
       broadcastJson({ type: "start_tx", from: ws.userId, name: ws.name });
       return;
     }
 
     case "stop_tx": {
+      console.log(`[TX STOP] ${ws.userId} (${ws.name}) | pacotes: ${audioPacketCount} | bytes: ${audioBytesRelayed}`);
       resetTransmitterIf(ws.userId);
       return;
     }
@@ -117,6 +125,7 @@ function handleJson(ws, data) {
 }
 
 wss.on("connection", ws => {
+  console.log("[WS] Cliente conectado");
   ws.userId = null;
   ws.name = "Anônimo";
   ws.isAlive = true;
@@ -133,6 +142,11 @@ wss.on("connection", ws => {
         }
       }
       audioPacketCount++;
+      audioBytesRelayed += data.length;
+      if (!audioLogStarted) {
+        audioLogStarted = true;
+        console.log(`[AUDIO] Primeiro pacote recebido de ${ws.userId}, ${data.length} bytes`);
+      }
       return;
     }
 
@@ -148,6 +162,7 @@ wss.on("connection", ws => {
   });
 
   ws.on("close", () => {
+    console.log(`[WS] Conexão encerrada: ${ws.userId || "não identificado"}`);
     if (!ws.userId) return;
     if (clients.get(ws.userId) === ws) clients.delete(ws.userId);
     resetTransmitterIf(ws.userId);
@@ -176,7 +191,8 @@ httpServer.listen(PORT, "0.0.0.0", () => {
 
 setInterval(() => {
   if (audioPacketCount > 0) {
-    console.log(`audio packets relayed: ${audioPacketCount}`);
+    console.log(`audio packets relayed: ${audioPacketCount} | bytes: ${audioBytesRelayed}`);
     audioPacketCount = 0;
+    audioBytesRelayed = 0;
   }
 }, 60000);
