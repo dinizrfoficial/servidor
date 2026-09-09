@@ -608,7 +608,6 @@ async function handleSessionOpen(
             }
 
         } catch (_) {
-            // Usa o nome do token se a leitura falhar.
         }
 
         sendHttpJson(
@@ -686,6 +685,7 @@ async function handleSessionOpen(
 
     const newSession = {
         sessionId,
+
         deviceId,
 
         createdAt:
@@ -695,17 +695,14 @@ async function handleSessionOpen(
             Date.now()
     };
 
-    /*
-     * Guarda a sessão nova.
-     */
     await sessionRef.set(
         newSession
     );
 
-    /*
-     * Se já havia WebSocket da sessão anterior,
-     * avisa e derruba o dispositivo antigo.
-     */
+    // ========================================================
+    // REVOGA CONEXÃO ANTERIOR
+    // ========================================================
+
     const oldWs =
         clients.get(
             uid
@@ -742,6 +739,10 @@ async function handleSessionOpen(
         } catch (_) {
         }
     }
+
+    // ========================================================
+    // NOME OFICIAL
+    // ========================================================
 
     let username =
         decoded.name ||
@@ -858,7 +859,8 @@ function normalizeUsername(
 ) {
 
     return String(
-        username || ""
+        username ||
+        ""
     )
         .trim()
         .toLowerCase()
@@ -935,7 +937,9 @@ const RATE_LIMIT_WINDOW =
 const RATE_LIMIT_MAX =
     30;
 
-function getRequestIp(req) {
+function getRequestIp(
+    req
+) {
 
     const forwarded =
         req.headers[
@@ -1331,6 +1335,7 @@ async function handleCheckRegistration(
                 !emailExists,
 
             usernameExists,
+
             emailExists
         }
     );
@@ -1524,6 +1529,7 @@ async function handleReserveUsername(
                     ) {
 
                         return {
+
                             reservationId,
 
                             expiresAt:
@@ -1544,6 +1550,7 @@ async function handleReserveUsername(
                     ) {
 
                         return {
+
                             reservationId,
 
                             expiresAt:
@@ -2321,7 +2328,9 @@ const wss =
 // WEBSOCKET UTILITIES
 // ============================================================
 
-function isOpen(ws) {
+function isOpen(
+    ws
+) {
 
     return (
         ws &&
@@ -2340,6 +2349,7 @@ function clientList() {
         )
         .map(
             ws => ({
+
                 id:
                     ws.userId,
 
@@ -2357,6 +2367,7 @@ function sendJson(
     if (
         !isOpen(ws)
     ) {
+
         return;
     }
 
@@ -2654,15 +2665,61 @@ async function handleJson(
         ws.deviceId =
             deviceId;
 
+        /*
+         * O nome público agora vem do Firebase.
+         * O cliente não pode escolher o nome.
+         */
         ws.name =
-            String(
-                data.name ||
-                    decoded.name ||
-                    "Anônimo"
-            ).slice(
-                0,
-                32
-            );
+            "Anônimo";
+
+        if (
+            db
+        ) {
+
+            try {
+
+                const profile =
+                    await db
+                        .ref(
+                            `users/${userId}`
+                        )
+                        .get();
+
+                if (
+                    profile.exists()
+                ) {
+
+                    ws.name =
+                        String(
+                            profile.val()?.username ||
+                            "Anônimo"
+                        ).slice(
+                            0,
+                            32
+                        );
+                }
+
+            } catch (error) {
+
+                console.error(
+                    `[IDENTIFY] erro buscando username: ${error.message}`
+                );
+
+                try {
+
+                    ws.name =
+                        String(
+                            decoded.name ||
+                            "Anônimo"
+                        ).slice(
+                            0,
+                            32
+                        );
+
+                } catch (_) {
+                }
+            }
+        }
 
         clients.set(
             userId,
@@ -2712,6 +2769,7 @@ async function handleJson(
                 activeTransmitter:
                     activeTransmitterId
                         ? {
+
                             id:
                                 activeTransmitterId,
 
@@ -2750,35 +2808,19 @@ async function handleJson(
     // ========================================================
     // UPDATE NAME
     // ========================================================
+    //
+    // O nome de usuário é permanente.
+    // Qualquer mensagem antiga "update_name" é ignorada.
+    //
 
     if (
         data.type ===
         "update_name"
     ) {
 
-        ws.name =
-            String(
-                data.name ||
-                    "Anônimo"
-            ).slice(
-                0,
-                32
-            );
-
         console.log(
-            `[NAME] ${ws.userId} -> ${ws.name}`
+            `[NAME IGNORED] ${ws.userId} tentou alterar o nome público`
         );
-
-        broadcastJson({
-            type:
-                "user_update",
-
-            id:
-                ws.userId,
-
-            name:
-                ws.name
-        });
 
         return;
     }
