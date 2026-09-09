@@ -1,9 +1,16 @@
 {
-  "name": "z-link-talk-audio-server",
-  "version": "2.0.0",
-  "private": true,
+  "name": "z-link-talk-server",
+  "version": "1.0.0",
+  "description": "Z-Link Talk WebSocket audio server with Firebase integration",
   "main": "server.js",
-  "type": "commonjs",
-  "scripts": {"start": "node server.js"},
-  "dependencies": {"ws": "^8.17.0"}
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.3.0",
+    "ws": "^8.21.3"
+  }
 }
