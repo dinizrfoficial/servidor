@@ -1,12 +1,19 @@
 const http = require("http");
 const WebSocket = require("ws");
-
-// ============================================================
-// FIREBASE ADMIN
-// ============================================================
-
-const admin = require("firebase-admin");
 const fs = require("fs");
+
+// ============================================================
+// FIREBASE ADMIN SDK - API MODULAR
+// ============================================================
+
+const {
+    initializeApp,
+    cert
+} = require("firebase-admin/app");
+
+const {
+    getDatabase
+} = require("firebase-admin/database");
 
 const FIREBASE_DATABASE_URL =
     process.env.FIREBASE_DATABASE_URL ||
@@ -18,9 +25,20 @@ const FIREBASE_SERVICE_ACCOUNT_PATH =
 let db = null;
 let firebaseReady = false;
 
+// ============================================================
+// FIREBASE INITIALIZATION
+// ============================================================
+
 function initializeFirebase() {
+
     try {
-        if (!fs.existsSync(FIREBASE_SERVICE_ACCOUNT_PATH)) {
+
+        if (
+            !fs.existsSync(
+                FIREBASE_SERVICE_ACCOUNT_PATH
+            )
+        ) {
+
             throw new Error(
                 `Arquivo de credencial não encontrado: ${FIREBASE_SERVICE_ACCOUNT_PATH}`
             );
@@ -34,17 +52,19 @@ function initializeFirebase() {
                 )
             );
 
-        admin.initializeApp({
-            credential: admin.credential.cert(
+        initializeApp({
+            credential: cert(
                 serviceAccount
             ),
             databaseURL:
                 FIREBASE_DATABASE_URL
         });
 
-        db = admin.database();
+        db =
+            getDatabase();
 
-        firebaseReady = true;
+        firebaseReady =
+            true;
 
         console.log(
             "[FIREBASE] Admin SDK inicializado"
@@ -63,16 +83,31 @@ function initializeFirebase() {
             error.message
         );
 
+        firebaseReady =
+            false;
+
+        db =
+            null;
+
         return false;
     }
 }
 
+// ============================================================
+// FIREBASE TEST
+// ============================================================
+
 async function testFirebaseConnection() {
 
-    if (!firebaseReady || !db) {
+    if (
+        !firebaseReady ||
+        !db
+    ) {
+
         console.error(
             "[FIREBASE] Banco não disponível para teste"
         );
+
         return false;
     }
 
@@ -99,14 +134,14 @@ async function testFirebaseConnection() {
             error.message
         );
 
-        firebaseReady = false;
+        firebaseReady =
+            false;
 
         return false;
     }
 }
 
 initializeFirebase();
-
 
 // ============================================================
 // HTTP
@@ -131,15 +166,21 @@ const httpServer =
 
             res.end(
                 JSON.stringify({
-                    service: "Z-Link Talk",
-                    status: "online",
-                    firebase: firebaseReady,
-                    timestamp: Date.now()
+                    service:
+                        "Z-Link Talk",
+
+                    status:
+                        "online",
+
+                    firebase:
+                        firebaseReady,
+
+                    timestamp:
+                        Date.now()
                 })
             );
         }
     );
-
 
 // ============================================================
 // WEBSOCKET
@@ -147,53 +188,65 @@ const httpServer =
 
 const wss =
     new WebSocket.WebSocketServer({
-        server: httpServer,
-        maxPayload: 64 * 1024
-    });
+        server:
+            httpServer,
 
+        maxPayload:
+            64 * 1024
+    });
 
 // ============================================================
 // CLIENTES
 // ============================================================
 
 // userId -> WebSocket
-const clients = new Map();
-
-
-// ============================================================
-// TRANSMISSOR ATUAL
-// ============================================================
-
-let activeTransmitterId = null;
-let activeTransmitStartedAt = 0;
-
+const clients =
+    new Map();
 
 // ============================================================
-// ESTATÍSTICAS DE ÁUDIO
+// TRANSMISSOR
 // ============================================================
 
-let audioPacketCount = 0;
-let audioBytesRelayed = 0;
+let activeTransmitterId =
+    null;
 
+let activeTransmitStartedAt =
+    0;
+
+// ============================================================
+// ÁUDIO
+// ============================================================
+
+let audioPacketCount =
+    0;
+
+let audioBytesRelayed =
+    0;
 
 // ============================================================
 // PROTOCOLO DE ÁUDIO
 // ============================================================
 //
-// [0]   = 0x5A ('Z')
-// [1]   = 0x4C ('L')
-// [2]   = versão 1
-// [3]   = flags
-// [4]   = sequência high
-// [5]   = sequência low
-// [6..] = payload Opus
+// [0] = 0x5A ('Z')
+// [1] = 0x4C ('L')
+// [2] = versão 1
+// [3] = flags
+// [4] = sequência
+// [5] = sequência
+// [6..] = Opus
 //
 
-const AUDIO_MAGIC_0 = 0x5A;
-const AUDIO_MAGIC_1 = 0x4C;
-const AUDIO_VERSION = 1;
-const AUDIO_HEADER_SIZE = 6;
+const AUDIO_MAGIC_0 =
+    0x5A;
 
+const AUDIO_MAGIC_1 =
+    0x4C;
+
+const AUDIO_VERSION =
+    1;
+
+const AUDIO_HEADER_SIZE =
+    6;
 
 // ============================================================
 // UTILITÁRIOS
@@ -203,10 +256,10 @@ function isOpen(ws) {
 
     return (
         ws &&
-        ws.readyState === WebSocket.OPEN
+        ws.readyState ===
+            WebSocket.OPEN
     );
 }
-
 
 function clientList() {
 
@@ -216,12 +269,14 @@ function clientList() {
         .filter(isOpen)
         .map(
             ws => ({
-                id: ws.userId,
-                name: ws.name
+                id:
+                    ws.userId,
+
+                name:
+                    ws.name
             })
         );
 }
-
 
 function sendJson(
     ws,
@@ -245,7 +300,6 @@ function sendJson(
         );
     }
 }
-
 
 function broadcastJson(
     data,
@@ -281,9 +335,8 @@ function broadcastJson(
     }
 }
 
-
 // ============================================================
-// VALIDAÇÃO DE ÁUDIO
+// VALIDAÇÃO DO ÁUDIO
 // ============================================================
 
 function isAudioPacket(
@@ -292,16 +345,19 @@ function isAudioPacket(
 
     return (
         Buffer.isBuffer(buf) &&
-        buf.length > AUDIO_HEADER_SIZE &&
-        buf[0] === AUDIO_MAGIC_0 &&
-        buf[1] === AUDIO_MAGIC_1 &&
-        buf[2] === AUDIO_VERSION
+        buf.length >
+            AUDIO_HEADER_SIZE &&
+        buf[0] ===
+            AUDIO_MAGIC_0 &&
+        buf[1] ===
+            AUDIO_MAGIC_1 &&
+        buf[2] ===
+            AUDIO_VERSION
     );
 }
 
-
 // ============================================================
-// CONTROLE DO TRANSMISSOR
+// RESET DO TRANSMISSOR
 // ============================================================
 
 function resetTransmitterIf(
@@ -309,7 +365,8 @@ function resetTransmitterIf(
 ) {
 
     if (
-        activeTransmitterId !== userId
+        activeTransmitterId !==
+        userId
     ) {
         return;
     }
@@ -318,15 +375,20 @@ function resetTransmitterIf(
         `[TX RESET] ${userId}`
     );
 
-    activeTransmitterId = null;
-    activeTransmitStartedAt = 0;
+    activeTransmitterId =
+        null;
+
+    activeTransmitStartedAt =
+        0;
 
     broadcastJson({
-        type: "stop_tx",
-        from: userId
+        type:
+            "stop_tx",
+
+        from:
+            userId
     });
 }
-
 
 // ============================================================
 // JSON / CONTROLE
@@ -339,18 +401,19 @@ function handleJson(
 
     if (
         !data ||
-        typeof data !== "object"
+        typeof data !==
+            "object"
     ) {
         return;
     }
-
 
     // ========================================================
     // IDENTIFY
     // ========================================================
 
     if (
-        data.type === "identify"
+        data.type ===
+        "identify"
     ) {
 
         const userId =
@@ -367,12 +430,10 @@ function handleJson(
             return;
         }
 
-
         const old =
             clients.get(
                 userId
             );
-
 
         if (
             old &&
@@ -398,7 +459,6 @@ function handleJson(
             }
         }
 
-
         ws.userId =
             userId;
 
@@ -411,23 +471,24 @@ function handleJson(
                 32
             );
 
-
         clients.set(
             userId,
             ws
         );
 
-
         console.log(
             `[IDENTIFY] ${userId} -> ${ws.name} | usuários: ${clients.size}`
         );
 
-
         sendJson(
             ws,
             {
-                type: "init",
-                id: userId,
+                type:
+                    "init",
+
+                id:
+                    userId,
+
                 clients:
                     clientList(),
 
@@ -447,17 +508,16 @@ function handleJson(
             }
         );
 
-
         broadcastJson({
-            type: "user_list",
+            type:
+                "user_list",
+
             clients:
                 clientList()
         });
 
-
         return;
     }
-
 
     // ========================================================
     // IDENTIFICAÇÃO OBRIGATÓRIA
@@ -467,13 +527,13 @@ function handleJson(
         return;
     }
 
-
     // ========================================================
     // UPDATE NAME
     // ========================================================
 
     if (
-        data.type === "update_name"
+        data.type ===
+        "update_name"
     ) {
 
         ws.name =
@@ -485,31 +545,31 @@ function handleJson(
                 32
             );
 
-
         console.log(
             `[NAME] ${ws.userId} -> ${ws.name}`
         );
 
-
         broadcastJson({
-            type: "user_update",
+            type:
+                "user_update",
+
             id:
                 ws.userId,
+
             name:
                 ws.name
         });
 
-
         return;
     }
-
 
     // ========================================================
     // START TX
     // ========================================================
 
     if (
-        data.type === "start_tx"
+        data.type ===
+        "start_tx"
     ) {
 
         if (
@@ -524,13 +584,12 @@ function handleJson(
                 )?.name ||
                 activeTransmitterId;
 
-
             console.log(
                 `[TX DENIED] ${ws.userId} ` +
-                `tentou transmitir; canal ocupado por ` +
+                `tentou transmitir; ` +
+                `canal ocupado por ` +
                 `${activeTransmitterId}`
             );
-
 
             sendJson(
                 ws,
@@ -543,64 +602,54 @@ function handleJson(
                 }
             );
 
-
             return;
         }
-
 
         activeTransmitterId =
             ws.userId;
 
-
         activeTransmitStartedAt =
             Date.now();
-
 
         audioPacketCount =
             0;
 
-
         audioBytesRelayed =
             0;
-
 
         console.log(
             `[TX START] ${ws.userId} (${ws.name})`
         );
 
+        broadcastJson({
+            type:
+                "start_tx",
 
-        broadcastJson(
-            {
-                type:
-                    "start_tx",
+            from:
+                ws.userId,
 
-                from:
-                    ws.userId,
-
-                name:
-                    ws.name
-            }
-        );
-
+            name:
+                ws.name
+        });
 
         return;
     }
-
 
     // ========================================================
     // STOP TX
     // ========================================================
 
     if (
-        data.type === "stop_tx"
+        data.type ===
+        "stop_tx"
     ) {
 
         const duration =
-            activeTransmitStartedAt > 0
+            activeTransmitStartedAt >
+            0
                 ? Date.now() -
                     activeTransmitStartedAt
                 : 0;
-
 
         console.log(
             `[TX STOP] ${ws.userId} (${ws.name}) | ` +
@@ -609,22 +658,20 @@ function handleJson(
             `duração: ${duration} ms`
         );
 
-
         resetTransmitterIf(
             ws.userId
         );
 
-
         return;
     }
-
 
     // ========================================================
     // PING APP
     // ========================================================
 
     if (
-        data.type === "ping_app"
+        data.type ===
+        "ping_app"
     ) {
 
         sendJson(
@@ -642,9 +689,8 @@ function handleJson(
     }
 }
 
-
 // ============================================================
-// NOVA CONEXÃO WEBSOCKET
+// WEBSOCKET CONNECTION
 // ============================================================
 
 wss.on(
@@ -655,18 +701,14 @@ wss.on(
             "[WS] Cliente conectado"
         );
 
-
         ws.userId =
             null;
-
 
         ws.name =
             "Anônimo";
 
-
         ws.isAlive =
             true;
-
 
         // ====================================================
         // PONG
@@ -675,10 +717,11 @@ wss.on(
         ws.on(
             "pong",
             () => {
-                ws.isAlive = true;
+
+                ws.isAlive =
+                    true;
             }
         );
-
 
         // ====================================================
         // MESSAGE
@@ -691,15 +734,12 @@ wss.on(
                 isBinary
             ) => {
 
-
                 // ============================================
                 // ÁUDIO
                 // ============================================
 
                 if (
-                    isAudioPacket(
-                        data
-                    )
+                    isAudioPacket(data)
                 ) {
 
                     if (
@@ -716,15 +756,13 @@ wss.on(
                         return;
                     }
 
-
                     audioPacketCount++;
+
                     audioBytesRelayed +=
                         data.length;
 
-
                     let delivered =
                         0;
-
 
                     // ========================================
                     // RETRANSMISSÃO
@@ -764,7 +802,6 @@ wss.on(
                         }
                     }
 
-
                     // ========================================
                     // LOG
                     // ========================================
@@ -778,7 +815,6 @@ wss.on(
                             data.length -
                             AUDIO_HEADER_SIZE;
 
-
                         console.log(
                             `[AUDIO] RX #${audioPacketCount} ` +
                             `de=${ws.userId} ` +
@@ -788,10 +824,8 @@ wss.on(
                         );
                     }
 
-
                     return;
                 }
-
 
                 // ============================================
                 // BINARY INVÁLIDO
@@ -807,13 +841,11 @@ wss.on(
                     return;
                 }
 
-
                 // ============================================
                 // JSON
                 // ============================================
 
                 let message;
-
 
                 try {
 
@@ -831,14 +863,12 @@ wss.on(
                     return;
                 }
 
-
                 handleJson(
                     ws,
                     message
                 );
             }
         );
-
 
         // ====================================================
         // CLOSE
@@ -858,11 +888,9 @@ wss.on(
                     `reason=${reason?.toString() || ""}`
                 );
 
-
                 if (!ws.userId) {
                     return;
                 }
-
 
                 if (
                     clients.get(
@@ -875,11 +903,9 @@ wss.on(
                     );
                 }
 
-
                 resetTransmitterIf(
                     ws.userId
                 );
-
 
                 broadcastJson({
                     type:
@@ -890,7 +916,6 @@ wss.on(
                 });
             }
         );
-
 
         // ====================================================
         // ERROR
@@ -910,7 +935,6 @@ wss.on(
     }
 );
 
-
 // ============================================================
 // HEARTBEAT
 // ============================================================
@@ -927,37 +951,34 @@ setInterval(
         ) {
 
             if (
-                ws.isAlive === false
+                ws.isAlive ===
+                false
             ) {
 
                 console.log(
                     `[HEARTBEAT] removendo conexão morta: ${userId}`
                 );
 
-
                 try {
+
                     ws.terminate();
+
                 } catch (_) {
                 }
-
 
                 clients.delete(
                     userId
                 );
 
-
                 resetTransmitterIf(
                     userId
                 );
 
-
                 continue;
             }
 
-
             ws.isAlive =
                 false;
-
 
             try {
 
@@ -971,9 +992,8 @@ setInterval(
     30_000
 );
 
-
 // ============================================================
-// HTTP SERVER START
+// SERVER START
 // ============================================================
 
 httpServer.listen(
@@ -985,11 +1005,6 @@ httpServer.listen(
             `Z-Link Talk Audio Server listening on ${PORT}`
         );
 
-
-        // ----------------------------------------------------
-        // Teste do Firebase
-        // ----------------------------------------------------
-
         await testFirebaseConnection();
 
         console.log(
@@ -998,9 +1013,8 @@ httpServer.listen(
     }
 );
 
-
 // ============================================================
-// ESTATÍSTICAS DE ÁUDIO
+// AUDIO STATS
 // ============================================================
 
 setInterval(
@@ -1016,10 +1030,8 @@ setInterval(
                 `bytes=${audioBytesRelayed}`
             );
 
-
             audioPacketCount =
                 0;
-
 
             audioBytesRelayed =
                 0;
