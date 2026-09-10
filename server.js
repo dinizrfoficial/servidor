@@ -201,6 +201,20 @@ const AUDIO_VERSION =
 const AUDIO_HEADER_SIZE =
     6;
 
+/*
+ * Quantidade de pacotes iniciais preservados de cada transmissão.
+ *
+ * 5 frames x 20 ms = aproximadamente 100 ms.
+ *
+ * O Android MediaCodec Opus mostrou no log que recebe normalmente
+ * pacotes quando entra no meio da transmissão, mas não produz PCM.
+ * Reenviar estes primeiros frames ao late-joiner fornece ao decoder
+ * o mesmo início de fluxo que ele recebe quando acompanha um TX
+ * desde o começo.
+ */
+const LATE_JOIN_BOOTSTRAP_PACKETS =
+    5;
+
 // ============================================================
 // CANAIS
 // ============================================================
@@ -5104,9 +5118,47 @@ function sendCurrentTransmitterStart(
         }
     );
 
+    const bootstrapPackets =
+        Array.isArray(active.bootstrapPackets)
+            ? active.bootstrapPackets
+            : [];
+
+    let bootstrapDelivered =
+        0;
+
+    /*
+     * Envia imediatamente, logo depois do start_tx lateJoin.
+     * Como isto acontece de forma síncrona no mesmo turno do event loop,
+     * estes pacotes entram na fila do WebSocket antes dos próximos frames
+     * live processados pelo servidor.
+     */
+    for (const packet of bootstrapPackets) {
+        try {
+            ws.send(
+                packet,
+                {
+                    binary: true
+                }
+            );
+
+            bootstrapDelivered++;
+
+        } catch (error) {
+            console.error(
+                `[LATE JOIN BOOTSTRAP ERROR] ` +
+                `listener=${ws.userId} ` +
+                `channel=${channelId} ` +
+                `${error.message}`
+            );
+
+            break;
+        }
+    }
+
     console.log(
         `[LATE JOIN TX SYNC] listener=${ws.userId} ` +
-        `speaker=${active.userId} channel=${channelId}`
+        `speaker=${active.userId} channel=${channelId} ` +
+        `bootstrap=${bootstrapDelivered}`
     );
 
     return true;
@@ -5751,7 +5803,14 @@ async function handleJson(
             avatar: ws.avatar || "",
             startedAt: Date.now(),
             audioPacketCount: 0,
-            audioBytesRelayed: 0
+            audioBytesRelayed: 0,
+
+            /*
+             * Cópias dos primeiros frames binários deste TX.
+             * São usadas somente para inicializar um usuário
+             * que entrar no canal com a fala já em andamento.
+             */
+            bootstrapPackets: []
         };
 
         activeTransmitters.set(
@@ -5947,6 +6006,21 @@ wss.on(
 
                     txState.audioPacketCount++;
                     txState.audioBytesRelayed += data.length;
+
+                    /*
+                     * Preserva somente os primeiros frames do TX.
+                     * Buffer.from cria uma cópia independente do buffer
+                     * recebido pelo WebSocket.
+                     */
+                    if (
+                        Array.isArray(txState.bootstrapPackets) &&
+                        txState.bootstrapPackets.length <
+                            LATE_JOIN_BOOTSTRAP_PACKETS
+                    ) {
+                        txState.bootstrapPackets.push(
+                            Buffer.from(data)
+                        );
+                    }
 
                     let delivered = 0;
 
