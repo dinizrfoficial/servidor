@@ -5040,6 +5040,78 @@ function buildChannelStateMessage(ws) {
     };
 }
 
+/*
+ * ============================================================
+ * SINCRONIZAÇÃO DE USUÁRIO QUE ENTRA NO MEIO DE UMA TRANSMISSÃO
+ * ============================================================
+ *
+ * Quando o start_tx original aconteceu antes deste WebSocket existir,
+ * o cliente novo recebia apenas activeTransmitters no init/channel_state.
+ * A interface sabia que alguém estava falando, mas o Android não passava
+ * pelo mesmo fluxo normal de start_tx que é usado quando a transmissão
+ * começa depois que o cliente já está conectado.
+ *
+ * Agora o servidor envia, somente para o cliente que acabou de entrar
+ * no canal, um start_tx de sincronização ANTES de continuar o fluxo live.
+ */
+function sendCurrentTransmitterStart(
+    ws,
+    channelId
+) {
+    if (
+        !isOpen(ws) ||
+        !ws.userId ||
+        !channelId ||
+        !isClientOnChannel(ws, channelId)
+    ) {
+        return false;
+    }
+
+    const active =
+        activeTransmitters.get(channelId);
+
+    if (
+        !active ||
+        active.userId === ws.userId
+    ) {
+        return false;
+    }
+
+    const channel =
+        Array.isArray(ws.channels)
+            ? ws.channels.find(
+                item =>
+                    String(item.id) ===
+                    String(channelId)
+            )
+            : null;
+
+    sendJson(
+        ws,
+        {
+            type: "start_tx",
+            from: active.userId,
+            name: active.name || active.userId,
+            avatar: active.avatar || "",
+            channelId,
+            channelName: channel?.name || "Canal",
+
+            /*
+             * O Android usa este marcador para saber que não é uma
+             * nova transmissão; ele entrou no meio de uma já ativa.
+             */
+            lateJoin: true
+        }
+    );
+
+    console.log(
+        `[LATE JOIN TX SYNC] listener=${ws.userId} ` +
+        `speaker=${active.userId} channel=${channelId}`
+    );
+
+    return true;
+}
+
 // ============================================================
 // AUDIO VALIDATION
 // ============================================================
@@ -5445,6 +5517,18 @@ async function handleJson(
             }
         );
 
+        /*
+         * IMPORTANTE: esta chamada acontece imediatamente depois do init,
+         * no mesmo fluxo do servidor. Assim o cliente recebe o start_tx
+         * de sincronização antes dos próximos pacotes live do transmissor.
+         */
+        if (ws.activeChannelId) {
+            sendCurrentTransmitterStart(
+                ws,
+                ws.activeChannelId
+            );
+        }
+
         broadcastUserLists();
 
         return;
@@ -5540,6 +5624,15 @@ async function handleJson(
         sendJson(
             ws,
             buildChannelStateMessage(ws)
+        );
+
+        /*
+         * Se o canal selecionado já está ocupado, reproduz o start_tx
+         * somente para este cliente recém-chegado ao canal.
+         */
+        sendCurrentTransmitterStart(
+            ws,
+            requestedChannelId
         );
 
         broadcastUserLists();
