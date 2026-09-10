@@ -2057,6 +2057,117 @@ async function handleMakeChannelAdmin(req, res) {
     }
 }
 
+async function handleRemoveChannelAdmin(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    try {
+        // Somente o criador/administrador principal pode revogar
+        // a função administrativa de um administrador delegado.
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        if (targetUid === decoded.uid || isChannelOwnerUser(channel, targetUid)) {
+            sendHttpJson(res, 400, {
+                success: false,
+                error: "O administrador principal não pode ter sua função removida"
+            });
+            return;
+        }
+
+        if (!isChannelDelegatedAdmin(channel, targetUid)) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Este usuário não é administrador deste canal"
+            });
+            return;
+        }
+
+        const now = Date.now();
+
+        await db.ref().update({
+            [`channels/${channelId}/admins/${targetUid}`]: null,
+            [`channels/${channelId}/updatedAt`]: now
+        });
+
+        const refreshedChannelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (refreshedChannelSnapshot.exists()) {
+            updateInMemoryChannelAdmins(
+                channelId,
+                refreshedChannelSnapshot.val() || {}
+            );
+        }
+
+        // Atualiza imediatamente a função exibida para quem está conectado,
+        // sem remover o usuário do canal e sem alterar o estado ligado/desligado.
+        await refreshConnectedClientChannels(targetUid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL REMOVE ADMIN] owner=${decoded.uid} ` +
+            `target=${targetUid} channel=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL REMOVE ADMIN]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível remover a função de administrador"
+        });
+    }
+}
+
 async function handleListBlockedChannelUsers(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -4667,6 +4778,14 @@ const httpServer =
                 req.url === "/api/channels/make-admin"
             ) {
                 await handleMakeChannelAdmin(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/channels/remove-admin"
+            ) {
+                await handleRemoveChannelAdmin(req, res);
                 return;
             }
 
