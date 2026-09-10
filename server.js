@@ -372,13 +372,27 @@ async function refreshConnectedClientChannels(uid) {
         ws.enabledChannelIds = state.enabledChannelIds;
         ws.defaultChannelId = state.defaultChannelId;
 
-        // Se o canal usado na transmissão deixou de estar ativo ou
-        // deixou de ser o padrão, encerramos a transmissão imediatamente.
+        // O canal aberto na interface é independente do canal padrão.
+        // Se ele deixou de existir/ficou desligado, voltamos para o padrão
+        // ativo (quando existir).
+        if (
+            ws.activeChannelId &&
+            !ws.enabledChannelIds.has(ws.activeChannelId)
+        ) {
+            ws.activeChannelId =
+                ws.defaultChannelId &&
+                ws.enabledChannelIds.has(ws.defaultChannelId)
+                    ? ws.defaultChannelId
+                    : null;
+        }
+
+        // A transmissão só é encerrada se o canal usado deixou de estar
+        // habilitado ou deixou de ser o canal atualmente selecionado.
         if (
             previousTxChannelId &&
             (
                 !ws.enabledChannelIds.has(previousTxChannelId) ||
-                ws.defaultChannelId !== previousTxChannelId
+                ws.activeChannelId !== previousTxChannelId
             )
         ) {
             resetTransmitterIf(uid);
@@ -999,6 +1013,249 @@ async function handleSetChannelAvatar(req, res) {
         sendHttpJson(res, 500, {
             success: false,
             error: "Não foi possível alterar a imagem do canal"
+        });
+    }
+}
+
+async function handleDeleteChannel(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId =
+        String(
+            body.channelId ||
+                ""
+        ).trim();
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const channelRef =
+            db.ref(
+                `channels/${channelId}`
+            );
+
+        const channelSnapshot =
+            await channelRef.get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel =
+            channelSnapshot.val() ||
+            {};
+
+        if (
+            String(
+                channel.ownerUid ||
+                    ""
+            ) !== decoded.uid
+        ) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "Somente o criador do canal pode deletá-lo"
+            });
+            return;
+        }
+
+        /*
+         * Se houver transmissão neste canal, encerra primeiro.
+         * Isso usa o estado em memória existente sem alterar o
+         * protocolo de áudio nem a lógica dos outros canais.
+         */
+        const activeState =
+            activeTransmitters.get(
+                channelId
+            );
+
+        if (activeState) {
+            activeTransmitters.delete(
+                channelId
+            );
+
+            const txClient =
+                clients.get(
+                    activeState.userId
+                );
+
+            if (
+                txClient &&
+                txClient.txChannelId === channelId
+            ) {
+                txClient.txChannelId =
+                    null;
+            }
+
+            broadcastJsonToChannel(
+                channelId,
+                {
+                    type:
+                        "stop_tx",
+
+                    from:
+                        activeState.userId,
+
+                    channelId
+                }
+            );
+        }
+
+        /*
+         * Remove o canal da coleção principal, da busca pública
+         * e da lista de todos os usuários que o adicionaram.
+         * Também limpa o canal padrão de quem ainda apontava para ele.
+         */
+        const usersSnapshot =
+            await db
+                .ref("users")
+                .get();
+
+        const allUsers =
+            usersSnapshot.exists()
+                ? usersSnapshot.val() || {}
+                : {};
+
+        const updates = {
+            [`channels/${channelId}`]:
+                null,
+
+            [`publicChannels/${channelId}`]:
+                null
+        };
+
+        const affectedUids =
+            new Set();
+
+        for (
+            const [
+                uid,
+                profileValue
+            ]
+            of Object.entries(
+                allUsers
+            )
+        ) {
+            const profile =
+                profileValue ||
+                {};
+
+            const memberships =
+                profile.channels ||
+                {};
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    memberships,
+                    channelId
+                )
+            ) {
+                updates[
+                    `users/${uid}/channels/${channelId}`
+                ] = null;
+
+                affectedUids.add(
+                    uid
+                );
+            }
+
+            if (
+                String(
+                    profile.defaultChannelId ||
+                        ""
+                ) === channelId
+            ) {
+                updates[
+                    `users/${uid}/defaultChannelId`
+                ] = null;
+
+                affectedUids.add(
+                    uid
+                );
+            }
+        }
+
+        affectedUids.add(
+            decoded.uid
+        );
+
+        await db
+            .ref()
+            .update(
+                updates
+            );
+
+        /*
+         * Sincroniza imediatamente os WebSockets dos usuários
+         * afetados. Assim o canal desaparece sem precisar reiniciar
+         * o aplicativo ou desligar o Wi-Fi.
+         */
+        for (
+            const uid
+            of affectedUids
+        ) {
+            await refreshConnectedClientChannels(
+                uid
+            );
+        }
+
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL DELETE] uid=${decoded.uid} id=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId
+        });
+
+    } catch (error) {
+        console.error(
+            "[CHANNEL DELETE]",
+            error.message
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível deletar o canal"
         });
     }
 }
@@ -3400,6 +3657,25 @@ const httpServer =
             }
 
             // ------------------------------------------------
+            // CHANNEL DELETE
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/delete"
+            ) {
+
+                await handleDeleteChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
             // CHANNEL ENABLE/DISABLE
             // ------------------------------------------------
 
@@ -3477,34 +3753,26 @@ function isOpen(ws) {
     );
 }
 
-function shareAnyEnabledChannel(a, b) {
-    if (!a || !b) {
-        return false;
-    }
-
-    const aChannels = a.enabledChannelIds || new Set();
-    const bChannels = b.enabledChannelIds || new Set();
-
-    // O próprio usuário continua aparecendo na lista mesmo sem canal.
-    if (a.userId && a.userId === b.userId) {
-        return true;
-    }
-
-    for (const channelId of aChannels) {
-        if (bChannels.has(channelId)) {
-            return true;
-        }
-    }
-
-    return false;
+function isClientOnChannel(client, channelId) {
+    return (
+        isOpen(client) &&
+        !!channelId &&
+        client.activeChannelId === channelId &&
+        client.enabledChannelIds?.has(channelId)
+    );
 }
 
 function clientListFor(ws) {
+    const channelId = ws?.activeChannelId || null;
+
+    if (!channelId) {
+        return [];
+    }
+
     return [
         ...clients.values()
     ]
-        .filter(isOpen)
-        .filter(client => shareAnyEnabledChannel(ws, client))
+        .filter(client => isClientOnChannel(client, channelId))
         .map(client => ({
             id: client.userId,
             name: client.name,
@@ -3562,9 +3830,8 @@ function broadcastJsonToChannel(
 
     for (const ws of clients.values()) {
         if (
-            !isOpen(ws) ||
-            ws.userId === exceptId ||
-            !ws.enabledChannelIds?.has(channelId)
+            !isClientOnChannel(ws, channelId) ||
+            ws.userId === exceptId
         ) {
             continue;
         }
@@ -3588,6 +3855,7 @@ function broadcastUserLists() {
 
         sendJson(ws, {
             type: "user_list",
+            channelId: ws.activeChannelId || null,
             clients: clientListFor(ws)
         });
     }
@@ -3597,7 +3865,7 @@ function activeTransmittersForClient(ws) {
     const result = [];
 
     for (const [channelId, state] of activeTransmitters) {
-        if (!ws.enabledChannelIds?.has(channelId)) {
+        if (!isClientOnChannel(ws, channelId)) {
             continue;
         }
 
@@ -3617,6 +3885,7 @@ function buildChannelStateMessage(ws) {
         type: "channel_state",
         channels: Array.isArray(ws.channels) ? ws.channels : [],
         defaultChannelId: ws.defaultChannelId || null,
+        activeChannelId: ws.activeChannelId || null,
         activeTransmitters: activeTransmittersForClient(ws)
     };
 }
@@ -3901,6 +4170,14 @@ async function handleJson(
             ws.defaultChannelId =
                 channelState.defaultChannelId;
 
+            // Ao conectar pela primeira vez, o canal padrão é a seleção
+            // inicial. A Activity pode trocar imediatamente via select_channel.
+            ws.activeChannelId =
+                ws.defaultChannelId &&
+                ws.enabledChannelIds.has(ws.defaultChannelId)
+                    ? ws.defaultChannelId
+                    : null;
+
         } catch (error) {
             console.error(
                 `[IDENTIFY CHANNELS] uid=${userId} ${error.message}`
@@ -3909,6 +4186,7 @@ async function handleJson(
             ws.channels = [];
             ws.enabledChannelIds = new Set();
             ws.defaultChannelId = null;
+            ws.activeChannelId = null;
         }
 
         ws.txChannelId =
@@ -3959,6 +4237,9 @@ async function handleJson(
                 id:
                     userId,
 
+                channelId:
+                    ws.activeChannelId || null,
+
                 clients:
                     clientListFor(ws),
 
@@ -3967,6 +4248,9 @@ async function handleJson(
 
                 defaultChannelId:
                     ws.defaultChannelId || null,
+
+                activeChannelId:
+                    ws.activeChannelId || null,
 
                 activeTransmitters:
                     activeForClient,
@@ -4017,6 +4301,59 @@ async function handleJson(
     }
 
     // ========================================================
+    // SELECT ACTIVE CHANNEL
+    // ========================================================
+
+    if (
+        data.type ===
+        "select_channel"
+    ) {
+        const requestedChannelId =
+            String(data.channelId || "").trim();
+
+        if (
+            !requestedChannelId ||
+            !ws.enabledChannelIds?.has(requestedChannelId)
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "channel_select_denied",
+                    channelId: requestedChannelId || null,
+                    message: "Este canal não está ativo."
+                }
+            );
+            return;
+        }
+
+        if (
+            ws.txChannelId &&
+            ws.txChannelId !== requestedChannelId
+        ) {
+            resetTransmitterIf(ws.userId);
+        }
+
+        ws.activeChannelId =
+            requestedChannelId;
+
+        sendJson(
+            ws,
+            {
+                type: "channel_selected",
+                channelId: requestedChannelId
+            }
+        );
+
+        sendJson(
+            ws,
+            buildChannelStateMessage(ws)
+        );
+
+        broadcastUserLists();
+        return;
+    }
+
+    // ========================================================
     // START TX
     // ========================================================
 
@@ -4024,8 +4361,14 @@ async function handleJson(
         data.type ===
         "start_tx"
     ) {
+        const requestedChannelId =
+            String(data.channelId || "").trim();
+
         const channelId =
-            ws.defaultChannelId || null;
+            requestedChannelId ||
+            ws.activeChannelId ||
+            ws.defaultChannelId ||
+            null;
 
         if (
             !channelId ||
@@ -4035,34 +4378,35 @@ async function handleJson(
                 ws,
                 {
                     type: "tx_denied",
-                    code: "NO_DEFAULT_CHANNEL",
-                    message: "Selecione um canal padrão ativo antes de transmitir."
+                    code: "NO_ACTIVE_CHANNEL",
+                    message: "Selecione um canal ativo antes de transmitir."
                 }
             );
 
             return;
         }
 
-        const requestedChannelId =
-            String(data.channelId || "").trim();
-
-        // O cliente não pode escolher um canal diferente do padrão
-        // apenas alterando a mensagem WebSocket.
+        // O pacote de controle e a tela aberta precisam apontar para
+        // o mesmo canal. Isso impede TX em um canal enquanto a interface
+        // está mostrando outro.
         if (
-            requestedChannelId &&
-            requestedChannelId !== channelId
+            ws.activeChannelId &&
+            channelId !== ws.activeChannelId
         ) {
             sendJson(
                 ws,
                 {
                     type: "tx_denied",
                     code: "INVALID_CHANNEL",
-                    message: "O PTT só pode transmitir no canal padrão."
+                    message: "O canal de transmissão não corresponde ao canal aberto."
                 }
             );
 
             return;
         }
+
+        ws.activeChannelId =
+            channelId;
 
         const active =
             activeTransmitters.get(channelId);
@@ -4148,7 +4492,7 @@ async function handleJson(
         "stop_tx"
     ) {
         const channelId =
-            ws.txChannelId || ws.defaultChannelId || null;
+            ws.txChannelId || ws.activeChannelId || null;
 
         const state = channelId
             ? activeTransmitters.get(channelId)
@@ -4237,6 +4581,9 @@ wss.on(
         ws.defaultChannelId =
             null;
 
+        ws.activeChannelId =
+            null;
+
         ws.txChannelId =
             null;
 
@@ -4300,9 +4647,8 @@ wss.on(
 
                     for (const client of clients.values()) {
                         if (
-                            isOpen(client) &&
-                            client.userId !== ws.userId &&
-                            client.enabledChannelIds?.has(channelId)
+                            isClientOnChannel(client, channelId) &&
+                            client.userId !== ws.userId
                         ) {
                             try {
                                 client.send(
