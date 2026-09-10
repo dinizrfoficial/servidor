@@ -209,6 +209,10 @@ const CHANNEL_ID_LENGTH = 8;
 const MAX_CHANNEL_NAME_LENGTH = 40;
 const MAX_CHANNEL_DESCRIPTION_LENGTH = 200;
 
+// Avatar pequeno armazenado como data URL (JPEG/PNG/WebP) no Realtime Database.
+// Mantemos um limite conservador para não deixar o banco crescer sem controle.
+const MAX_AVATAR_LENGTH = 80_000;
+
 function sanitizeChannelName(value) {
     return String(value || "")
         .trim()
@@ -224,6 +228,26 @@ function sanitizeChannelDescription(value) {
 
 function normalizeChannelType(value) {
     return value === "private" ? "private" : "public";
+}
+
+function sanitizeAvatar(value) {
+    const text = String(value || "").trim();
+
+    if (!text) {
+        return "";
+    }
+
+    // Imagem enviada pelo app ao criar o canal.
+    if (/^data:image\/(jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=\r\n]+$/i.test(text)) {
+        return text.length <= MAX_AVATAR_LENGTH ? text : "";
+    }
+
+    // Também aceitamos URL HTTPS para compatibilidade futura com avatar de usuário.
+    if (/^https:\/\/[^\s]+$/i.test(text) && text.length <= 2048) {
+        return text;
+    }
+
+    return "";
 }
 
 function isValidChannelId(value) {
@@ -284,6 +308,7 @@ async function getUserChannels(uid) {
             description: channel.description || "",
             type: channel.type || "public",
             ownerUid: channel.ownerUid || "",
+            avatar: sanitizeAvatar(channel.avatar),
             enabled: membership?.enabled !== false,
             addedAt: Number(membership?.addedAt || 0)
         });
@@ -409,6 +434,7 @@ async function handleCreateChannel(req, res) {
     const name = sanitizeChannelName(body.name);
     const description = sanitizeChannelDescription(body.description);
     const type = normalizeChannelType(body.type);
+    const avatar = sanitizeAvatar(body.avatar);
 
     if (name.length < 3) {
         sendHttpJson(res, 400, {
@@ -428,6 +454,7 @@ async function handleCreateChannel(req, res) {
             description,
             type,
             ownerUid: decoded.uid,
+            avatar,
             createdAt: now,
             updatedAt: now
         };
@@ -437,6 +464,7 @@ async function handleCreateChannel(req, res) {
             updates[`publicChannels/${channelId}`] = {
                 name,
                 description,
+                avatar,
                 createdAt: now
             };
         }
@@ -474,6 +502,7 @@ async function handleCreateChannel(req, res) {
                 description,
                 type,
                 ownerUid: decoded.uid,
+                avatar,
                 enabled: true,
                 isDefault: !userProfile.defaultChannelId
             }
@@ -594,6 +623,7 @@ async function handleSearchPublicChannels(req, res) {
                 id,
                 name: channel?.name || "Canal",
                 description: channel?.description || "",
+                avatar: sanitizeAvatar(channel?.avatar),
                 type: "public"
             }));
 
@@ -717,6 +747,7 @@ async function handleAddChannel(req, res) {
                 description: channel.description || "",
                 type: channel.type || "private",
                 ownerUid: channel.ownerUid || "",
+                avatar: sanitizeAvatar(channel.avatar),
                 enabled: true,
                 isDefault
             }
@@ -726,6 +757,248 @@ async function handleAddChannel(req, res) {
         sendHttpJson(res, 500, {
             success: false,
             error: "Não foi possível adicionar o canal"
+        });
+    }
+}
+
+
+async function handleGetUserMe(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    try {
+        const profile = await getUserProfile(decoded.uid);
+        sendHttpJson(res, 200, {
+            success: true,
+            uid: decoded.uid,
+            username: profile.username || decoded.name || "",
+            avatar: sanitizeAvatar(
+                profile.avatar ||
+                profile.avatarData ||
+                profile.photoUrl ||
+                decoded.picture ||
+                ""
+            )
+        });
+    } catch (error) {
+        console.error("[USER ME]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar o perfil"
+        });
+    }
+}
+
+async function handleSetUserAvatar(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const rawAvatar = String(body.avatar || "").trim();
+    const avatar = sanitizeAvatar(rawAvatar);
+
+    if (rawAvatar && !avatar) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Imagem inválida ou muito grande"
+        });
+        return;
+    }
+
+    try {
+        await db
+            .ref(`users/${decoded.uid}/avatar`)
+            .set(avatar || null);
+
+        const ws = clients.get(decoded.uid);
+        if (ws && isOpen(ws)) {
+            ws.avatar = avatar;
+
+            for (const state of activeTransmitters.values()) {
+                if (state.userId === decoded.uid) {
+                    state.avatar = avatar;
+                }
+            }
+
+            // Atualiza imediatamente todos que compartilham algum canal com este usuário.
+            for (const peer of clients.values()) {
+                if (!isOpen(peer) || !shareAnyEnabledChannel(peer, ws)) {
+                    continue;
+                }
+
+                sendJson(peer, {
+                    type: "user_update",
+                    id: decoded.uid,
+                    name: ws.name || "Anônimo",
+                    avatar
+                });
+            }
+        }
+
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            avatar
+        });
+    } catch (error) {
+        console.error("[USER AVATAR]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar a imagem do perfil"
+        });
+    }
+}
+
+async function handleSetChannelAvatar(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const rawAvatar = String(body.avatar || "").trim();
+    const avatar = sanitizeAvatar(rawAvatar);
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    if (rawAvatar && !avatar) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Imagem inválida ou muito grande"
+        });
+        return;
+    }
+
+    try {
+        const channelRef = db.ref(`channels/${channelId}`);
+        const snapshot = await channelRef.get();
+
+        if (!snapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel = snapshot.val() || {};
+        if (String(channel.ownerUid || "") !== decoded.uid) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "Somente o criador do canal pode alterar esta imagem"
+            });
+            return;
+        }
+
+        const updates = {};
+        updates[`channels/${channelId}/avatar`] = avatar || null;
+        updates[`channels/${channelId}/updatedAt`] = Date.now();
+
+        if ((channel.type || "public") === "public") {
+            updates[`publicChannels/${channelId}/avatar`] = avatar || null;
+        }
+
+        await db.ref().update(updates);
+
+        // Atualiza o estado em memória e avisa clientes já conectados.
+        for (const ws of clients.values()) {
+            const item = (ws.channels || [])
+                .find(entry => String(entry.id) === channelId);
+
+            if (!item) {
+                continue;
+            }
+
+            item.avatar = avatar;
+            if (isOpen(ws)) {
+                sendJson(ws, buildChannelStateMessage(ws));
+            }
+        }
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            avatar
+        });
+    } catch (error) {
+        console.error("[CHANNEL AVATAR]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar a imagem do canal"
         });
     }
 }
@@ -996,7 +1269,7 @@ function readJsonBody(
 
                     if (
                         body.length >
-                        16 * 1024
+                        256 * 1024
                     ) {
 
                         finished =
@@ -2998,6 +3271,40 @@ const httpServer =
             }
 
             // ------------------------------------------------
+            // USER PROFILE / AVATAR
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "GET" &&
+                req.url.split("?")[0] ===
+                    "/api/users/me"
+            ) {
+
+                await handleGetUserMe(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/users/avatar"
+            ) {
+
+                await handleSetUserAvatar(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
             // CHANNEL LIST
             // ------------------------------------------------
 
@@ -3066,6 +3373,25 @@ const httpServer =
             ) {
 
                 await handleAddChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL AVATAR
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/avatar"
+            ) {
+
+                await handleSetChannelAvatar(
                     req,
                     res
                 );
@@ -3181,7 +3507,8 @@ function clientListFor(ws) {
         .filter(client => shareAnyEnabledChannel(ws, client))
         .map(client => ({
             id: client.userId,
-            name: client.name
+            name: client.name,
+            avatar: client.avatar || ""
         }));
 }
 
@@ -3277,7 +3604,8 @@ function activeTransmittersForClient(ws) {
         result.push({
             channelId,
             id: state.userId,
-            name: state.name || state.userId
+            name: state.name || state.userId,
+            avatar: state.avatar || ""
         });
     }
 
@@ -3543,6 +3871,23 @@ async function handleJson(
                 32
             );
 
+        // Avatar do usuário é apenas metadado visual.
+        // Se o perfil ainda não tiver avatar, usamos o picture do token (quando existir)
+        // e, na ausência dos dois, o Android mostra a inicial do nome.
+        ws.avatar = sanitizeAvatar(decoded.picture || "");
+
+        try {
+            const profile = await getUserProfile(userId);
+            ws.avatar = sanitizeAvatar(
+                profile.avatar ||
+                profile.avatarData ||
+                profile.photoUrl ||
+                ws.avatar
+            );
+        } catch (_) {
+            // Mantém o avatar do token ou vazio.
+        }
+
         try {
             const channelState =
                 await loadClientChannelState(userId);
@@ -3632,6 +3977,7 @@ async function handleJson(
                         ? {
                             id: activeForClient[0].id,
                             name: activeForClient[0].name,
+                            avatar: activeForClient[0].avatar || "",
                             channelId: activeForClient[0].channelId
                         }
                         : null
@@ -3737,6 +4083,7 @@ async function handleJson(
                     code: "CHANNEL_BUSY",
                     channelId,
                     name: active.name || active.userId,
+                    avatar: active.avatar || "",
                     message: "Canal ocupado"
                 }
             );
@@ -3755,6 +4102,7 @@ async function handleJson(
         const state = {
             userId: ws.userId,
             name: ws.name,
+            avatar: ws.avatar || "",
             startedAt: Date.now(),
             audioPacketCount: 0,
             audioBytesRelayed: 0
@@ -3782,6 +4130,7 @@ async function handleJson(
                 type: "start_tx",
                 from: ws.userId,
                 name: ws.name,
+                avatar: ws.avatar || "",
                 channelId,
                 channelName: channel?.name || "Canal"
             }
@@ -3875,6 +4224,9 @@ wss.on(
 
         ws.name =
             "Anônimo";
+
+        ws.avatar =
+            "";
 
         ws.channels =
             [];
