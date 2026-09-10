@@ -1260,6 +1260,135 @@ async function handleDeleteChannel(req, res) {
     }
 }
 
+async function handleRemoveChannel(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(
+        body.channelId || ""
+    ).trim();
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const channelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+
+        // O criador deve excluir o canal permanentemente; não deixamos
+        // o canal ficar sem seu responsável principal por engano.
+        if (String(channel.ownerUid || "") === decoded.uid) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "O criador do canal deve usar a opção Excluir canal"
+            });
+            return;
+        }
+
+        const membershipRef = db.ref(
+            `users/${decoded.uid}/channels/${channelId}`
+        );
+        const membershipSnapshot = await membershipRef.get();
+
+        if (!membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não está na sua lista"
+            });
+            return;
+        }
+
+        const profileSnapshot = await db
+            .ref(`users/${decoded.uid}`)
+            .get();
+        const profile = profileSnapshot.exists()
+            ? profileSnapshot.val() || {}
+            : {};
+
+        // Se este usuário estiver transmitindo neste canal, encerra antes.
+        const activeState = activeTransmitters.get(channelId);
+        if (activeState && activeState.userId === decoded.uid) {
+            resetTransmitterIf(decoded.uid);
+        }
+
+        const updates = {
+            [`users/${decoded.uid}/channels/${channelId}`]: null
+        };
+
+        if (String(profile.defaultChannelId || "") === channelId) {
+            updates[`users/${decoded.uid}/defaultChannelId`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        await refreshConnectedClientChannels(decoded.uid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL REMOVE] uid=${decoded.uid} id=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId
+        });
+
+    } catch (error) {
+        console.error(
+            "[CHANNEL REMOVE]",
+            error.message
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível remover o canal da sua lista"
+        });
+    }
+}
+
 async function handleSetChannelEnabled(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -3676,6 +3805,25 @@ const httpServer =
             }
 
             // ------------------------------------------------
+            // CHANNEL REMOVE FROM USER LIST
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/remove"
+            ) {
+
+                await handleRemoveChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
             // CHANNEL ENABLE/DISABLE
             // ------------------------------------------------
 
@@ -4091,31 +4239,54 @@ async function handleJson(
             old !== ws
         ) {
 
+            const sameLogicalSession =
+                old.sessionId === sessionId &&
+                old.deviceId === deviceId;
+
             console.log(
-                `[IDENTIFY] substituindo conexão anterior de ${userId}`
+                sameLogicalSession
+                    ? `[IDENTIFY] renovando conexão da mesma sessão ${userId}`
+                    : `[IDENTIFY] substituindo conexão anterior de ${userId}`
             );
 
             try {
 
-                sendJson(
-                    old,
-                    {
-                        type:
-                            "session_revoked",
+                if (sameLogicalSession) {
+                    /*
+                     * Uma queda/reconexão do mesmo aparelho não é uma
+                     * revogação de sessão. Fechamos o socket antigo sem
+                     * mandar session_revoked para não bloquear o cliente.
+                     */
+                    old.close(
+                        1000,
+                        "Connection refreshed"
+                    );
 
-                        reason:
-                            "Você entrou com outro dispositivo."
-                    }
-                );
+                } else {
+                    sendJson(
+                        old,
+                        {
+                            type:
+                                "session_revoked",
 
-                old.close(
-                    4001,
-                    "Session replaced"
-                );
+                            reason:
+                                "Você entrou com outro dispositivo."
+                        }
+                    );
+
+                    old.close(
+                        4001,
+                        "Session replaced"
+                    );
+                }
 
             } catch (_) {
             }
 
+            /*
+             * Se o socket antigo estava transmitindo, encerra somente esse
+             * estado antes de registrar a nova conexão.
+             */
             resetTransmitterIf(
                 userId
             );
@@ -4761,22 +4932,25 @@ wss.on(
                     return;
                 }
 
-                if (
+                const wasCurrentConnection =
                     clients.get(
                         ws.userId
-                    ) === ws
+                    ) === ws;
+
+                if (
+                    wasCurrentConnection
                 ) {
 
                     clients.delete(
                         ws.userId
                     );
+
+                    resetTransmitterIf(
+                        ws.userId
+                    );
+
+                    broadcastUserLists();
                 }
-
-                resetTransmitterIf(
-                    ws.userId
-                );
-
-                broadcastUserLists();
             }
         );
 
