@@ -301,6 +301,12 @@ async function getUserChannels(uid) {
         }
 
         const channel = channelSnapshot.val() || {};
+        const blocked =
+            !!channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                uid
+            );
 
         result.push({
             id: channelId,
@@ -309,7 +315,8 @@ async function getUserChannels(uid) {
             type: channel.type || "public",
             ownerUid: channel.ownerUid || "",
             avatar: sanitizeAvatar(channel.avatar),
-            enabled: membership?.enabled !== false,
+            blocked,
+            enabled: !blocked && membership?.enabled !== false,
             addedAt: Number(membership?.addedAt || 0)
         });
     }
@@ -337,6 +344,12 @@ async function loadClientChannelState(uid) {
             .map(channel => String(channel.id))
     );
 
+    const blockedChannelIds = new Set(
+        data.channels
+            .filter(channel => channel.blocked === true)
+            .map(channel => String(channel.id))
+    );
+
     let defaultChannelId = data.defaultChannelId
         ? String(data.defaultChannelId)
         : null;
@@ -352,6 +365,7 @@ async function loadClientChannelState(uid) {
     return {
         channels: data.channels,
         enabledChannelIds,
+        blockedChannelIds,
         defaultChannelId
     };
 }
@@ -370,6 +384,7 @@ async function refreshConnectedClientChannels(uid) {
 
         ws.channels = state.channels;
         ws.enabledChannelIds = state.enabledChannelIds;
+        ws.blockedChannelIds = state.blockedChannelIds;
         ws.defaultChannelId = state.defaultChannelId;
 
         // O canal aberto na interface é independente do canal padrão.
@@ -711,6 +726,22 @@ async function handleAddChannel(req, res) {
         }
 
         const channel = channelSnapshot.val() || {};
+
+        if (
+            channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                decoded.uid
+            )
+        ) {
+            sendHttpJson(res, 403, {
+                success: false,
+                code: "CHANNEL_BLOCKED",
+                error: "Você não pode entrar neste canal, pois foi bloqueado nele."
+            });
+            return;
+        }
+
         const membershipRef = db
             .ref(`users/${decoded.uid}/channels/${channelId}`);
 
@@ -1389,6 +1420,469 @@ async function handleRemoveChannel(req, res) {
     }
 }
 
+
+// ============================================================
+// ADMINISTRAÇÃO DE USUÁRIOS DO CANAL
+// ============================================================
+
+async function getOwnedChannelOrRespond(res, ownerUid, channelId) {
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return null;
+    }
+
+    const snapshot = await db
+        .ref(`channels/${channelId}`)
+        .get();
+
+    if (!snapshot.exists()) {
+        sendHttpJson(res, 404, {
+            success: false,
+            error: "Canal não encontrado"
+        });
+        return null;
+    }
+
+    const channel = snapshot.val() || {};
+
+    if (String(channel.ownerUid || "") !== ownerUid) {
+        sendHttpJson(res, 403, {
+            success: false,
+            error: "Somente o administrador do canal pode executar esta ação"
+        });
+        return null;
+    }
+
+    return channel;
+}
+
+async function handleDisconnectChannelUser(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    if (targetUid === decoded.uid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "O administrador não pode desconectar a si mesmo"
+        });
+        return;
+    }
+
+    try {
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        const membershipRef = db.ref(
+            `users/${targetUid}/channels/${channelId}`
+        );
+        const membershipSnapshot = await membershipRef.get();
+
+        if (!membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Este usuário não participa do canal"
+            });
+            return;
+        }
+
+        const membership = membershipSnapshot.val() || {};
+        const targetProfile = await getUserProfile(targetUid);
+        const updates = {};
+
+        updates[`users/${targetUid}/channels/${channelId}/enabled`] = false;
+        updates[`users/${targetUid}/channels/${channelId}/addedAt`] =
+            Number(membership.addedAt || Date.now());
+
+        if (String(targetProfile.defaultChannelId || "") === channelId) {
+            updates[`users/${targetUid}/defaultChannelId`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        resetTransmitterIf(targetUid);
+
+        const targetWs = clients.get(targetUid);
+        if (
+            targetWs &&
+            isOpen(targetWs) &&
+            targetWs.activeChannelId === channelId
+        ) {
+            sendJson(targetWs, {
+                type: "channel_disconnected",
+                channelId,
+                message: "Você foi desconectado deste canal pelo administrador."
+            });
+        }
+
+        await refreshConnectedClientChannels(targetUid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL DISCONNECT USER] admin=${decoded.uid} ` +
+            `target=${targetUid} channel=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL DISCONNECT USER]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível desconectar o usuário"
+        });
+    }
+}
+
+async function handleBlockChannelUser(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    if (targetUid === decoded.uid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "O administrador não pode bloquear a si mesmo"
+        });
+        return;
+    }
+
+    try {
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        const membershipRef = db.ref(
+            `users/${targetUid}/channels/${channelId}`
+        );
+        const membershipSnapshot = await membershipRef.get();
+
+        if (!membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Este usuário não participa do canal"
+            });
+            return;
+        }
+
+        const membership = membershipSnapshot.val() || {};
+        const targetProfile = await getUserProfile(targetUid);
+        const now = Date.now();
+        const updates = {};
+
+        updates[`channels/${channelId}/blockedUsers/${targetUid}`] = {
+            blockedAt: now,
+            blockedBy: decoded.uid
+        };
+        updates[`channels/${channelId}/updatedAt`] = now;
+        updates[`users/${targetUid}/channels/${channelId}/enabled`] = false;
+        updates[`users/${targetUid}/channels/${channelId}/addedAt`] =
+            Number(membership.addedAt || now);
+
+        if (String(targetProfile.defaultChannelId || "") === channelId) {
+            updates[`users/${targetUid}/defaultChannelId`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        resetTransmitterIf(targetUid);
+
+        const targetWs = clients.get(targetUid);
+        if (
+            targetWs &&
+            isOpen(targetWs) &&
+            targetWs.activeChannelId === channelId
+        ) {
+            sendJson(targetWs, {
+                type: "channel_blocked",
+                channelId,
+                message: "Você foi bloqueado neste canal pelo administrador."
+            });
+        }
+
+        await refreshConnectedClientChannels(targetUid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL BLOCK USER] admin=${decoded.uid} ` +
+            `target=${targetUid} channel=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL BLOCK USER]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível bloquear o usuário"
+        });
+    }
+}
+
+async function handleUnblockChannelUser(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    try {
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        await db
+            .ref(`channels/${channelId}/blockedUsers/${targetUid}`)
+            .set(null);
+
+        await db
+            .ref(`channels/${channelId}/updatedAt`)
+            .set(Date.now());
+
+        await refreshConnectedClientChannels(targetUid);
+
+        console.log(
+            `[CHANNEL UNBLOCK USER] admin=${decoded.uid} ` +
+            `target=${targetUid} channel=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL UNBLOCK USER]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível desbloquear o usuário"
+        });
+    }
+}
+
+async function handleListBlockedChannelUsers(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    const url = new URL(
+        req.url,
+        `http://${req.headers.host || "localhost"}`
+    );
+    const channelId = String(
+        url.searchParams.get("channelId") || ""
+    ).trim();
+
+    try {
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        const blockedUsers = channel.blockedUsers || {};
+        const result = [];
+
+        for (const [uid, infoValue] of Object.entries(blockedUsers)) {
+            const info = infoValue || {};
+            let profile = {};
+
+            try {
+                profile = await getUserProfile(uid);
+            } catch (_) {
+                profile = {};
+            }
+
+            const liveClient = clients.get(uid);
+            const name = String(
+                profile.username ||
+                profile.name ||
+                liveClient?.name ||
+                "Usuário"
+            ).trim() || "Usuário";
+
+            const avatar = sanitizeAvatar(
+                profile.avatar ||
+                profile.avatarData ||
+                profile.photoUrl ||
+                liveClient?.avatar ||
+                ""
+            );
+
+            result.push({
+                id: uid,
+                name,
+                avatar,
+                blockedAt: Number(info.blockedAt || 0)
+            });
+        }
+
+        result.sort((a, b) =>
+            (b.blockedAt || 0) - (a.blockedAt || 0)
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            users: result
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL BLOCKED USERS]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar os usuários bloqueados"
+        });
+    }
+}
+
 async function handleSetChannelEnabled(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -1432,6 +1926,36 @@ async function handleSetChannelEnabled(req, res) {
     }
 
     try {
+        const channelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+
+        if (
+            enabled &&
+            channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                decoded.uid
+            )
+        ) {
+            sendHttpJson(res, 403, {
+                success: false,
+                code: "CHANNEL_BLOCKED",
+                error: "Você não pode entrar neste canal, pois foi bloqueado nele."
+            });
+            return;
+        }
+
         const membershipRef = db
             .ref(`users/${decoded.uid}/channels/${channelId}`);
 
@@ -1525,6 +2049,35 @@ async function handleSetDefaultChannel(req, res) {
     }
 
     try {
+        const channelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+
+        if (
+            channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                decoded.uid
+            )
+        ) {
+            sendHttpJson(res, 403, {
+                success: false,
+                code: "CHANNEL_BLOCKED",
+                error: "Você não pode entrar neste canal, pois foi bloqueado nele."
+            });
+            return;
+        }
+
         const membership = await db
             .ref(`users/${decoded.uid}/channels/${channelId}`)
             .get();
@@ -3824,6 +4377,42 @@ const httpServer =
             }
 
             // ------------------------------------------------
+            // CHANNEL ADMIN - CONNECTED / BLOCKED USERS
+            // ------------------------------------------------
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/channels/disconnect-user"
+            ) {
+                await handleDisconnectChannelUser(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/channels/block-user"
+            ) {
+                await handleBlockChannelUser(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/channels/unblock-user"
+            ) {
+                await handleUnblockChannelUser(req, res);
+                return;
+            }
+
+            if (
+                req.method === "GET" &&
+                req.url.split("?")[0] === "/api/channels/blocked-users"
+            ) {
+                await handleListBlockedChannelUsers(req, res);
+                return;
+            }
+
+            // ------------------------------------------------
             // CHANNEL ENABLE/DISABLE
             // ------------------------------------------------
 
@@ -4338,6 +4927,9 @@ async function handleJson(
             ws.enabledChannelIds =
                 channelState.enabledChannelIds;
 
+            ws.blockedChannelIds =
+                channelState.blockedChannelIds;
+
             ws.defaultChannelId =
                 channelState.defaultChannelId;
 
@@ -4356,6 +4948,7 @@ async function handleJson(
 
             ws.channels = [];
             ws.enabledChannelIds = new Set();
+            ws.blockedChannelIds = new Set();
             ws.defaultChannelId = null;
             ws.activeChannelId = null;
         }
@@ -4483,6 +5076,22 @@ async function handleJson(
             String(data.channelId || "").trim();
 
         if (
+            requestedChannelId &&
+            ws.blockedChannelIds?.has(requestedChannelId)
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "channel_select_denied",
+                    code: "CHANNEL_BLOCKED",
+                    channelId: requestedChannelId,
+                    message: "Você não pode entrar neste canal, pois foi bloqueado nele."
+                }
+            );
+            return;
+        }
+
+        if (
             !requestedChannelId ||
             !ws.enabledChannelIds?.has(requestedChannelId)
         ) {
@@ -4540,6 +5149,22 @@ async function handleJson(
             ws.activeChannelId ||
             ws.defaultChannelId ||
             null;
+
+        if (
+            channelId &&
+            ws.blockedChannelIds?.has(channelId)
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "CHANNEL_BLOCKED",
+                    channelId,
+                    message: "Você não pode entrar neste canal, pois foi bloqueado nele."
+                }
+            );
+            return;
+        }
 
         if (
             !channelId ||
@@ -4747,6 +5372,9 @@ wss.on(
             [];
 
         ws.enabledChannelIds =
+            new Set();
+
+        ws.blockedChannelIds =
             new Set();
 
         ws.defaultChannelId =
