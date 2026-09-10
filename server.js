@@ -202,6 +202,604 @@ const AUDIO_HEADER_SIZE =
     6;
 
 // ============================================================
+// CANAIS
+// ============================================================
+
+const CHANNEL_ID_LENGTH = 8;
+const MAX_CHANNEL_NAME_LENGTH = 40;
+const MAX_CHANNEL_DESCRIPTION_LENGTH = 200;
+
+function sanitizeChannelName(value) {
+    return String(value || "")
+        .trim()
+        .replace(/\s+/g, " ")
+        .slice(0, MAX_CHANNEL_NAME_LENGTH);
+}
+
+function sanitizeChannelDescription(value) {
+    return String(value || "")
+        .trim()
+        .slice(0, MAX_CHANNEL_DESCRIPTION_LENGTH);
+}
+
+function normalizeChannelType(value) {
+    return value === "private" ? "private" : "public";
+}
+
+function isValidChannelId(value) {
+    return /^[0-9]{8}$/.test(String(value || ""));
+}
+
+async function generateUniqueChannelId() {
+    for (let attempt = 0; attempt < 20; attempt++) {
+        const id = String(
+            crypto.randomInt(0, 100_000_000)
+        ).padStart(CHANNEL_ID_LENGTH, "0");
+
+        const snapshot = await db
+            .ref(`channels/${id}`)
+            .get();
+
+        if (!snapshot.exists()) {
+            return id;
+        }
+    }
+
+    throw new Error("Não foi possível gerar um ID de canal disponível");
+}
+
+async function getUserProfile(uid) {
+    const snapshot = await db
+        .ref(`users/${uid}`)
+        .get();
+
+    return snapshot.exists() ? snapshot.val() || {} : {};
+}
+
+async function getUserChannels(uid) {
+    const membershipSnapshot = await db
+        .ref(`users/${uid}/channels`)
+        .get();
+
+    const memberships = membershipSnapshot.exists()
+        ? membershipSnapshot.val() || {}
+        : {};
+
+    const result = [];
+
+    for (const [channelId, membership] of Object.entries(memberships)) {
+        const channelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (!channelSnapshot.exists()) {
+            continue;
+        }
+
+        const channel = channelSnapshot.val() || {};
+
+        result.push({
+            id: channelId,
+            name: channel.name || "Canal",
+            description: channel.description || "",
+            type: channel.type || "public",
+            ownerUid: channel.ownerUid || "",
+            enabled: membership?.enabled !== false,
+            addedAt: Number(membership?.addedAt || 0)
+        });
+    }
+
+    result.sort((a, b) => b.addedAt - a.addedAt);
+
+    const userProfile = await getUserProfile(uid);
+
+    return {
+        channels: result,
+        defaultChannelId: userProfile.defaultChannelId || null
+    };
+}
+
+async function handleCreateChannel(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const name = sanitizeChannelName(body.name);
+    const description = sanitizeChannelDescription(body.description);
+    const type = normalizeChannelType(body.type);
+
+    if (name.length < 3) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "O nome do canal deve ter pelo menos 3 caracteres"
+        });
+        return;
+    }
+
+    try {
+        const channelId = await generateUniqueChannelId();
+        const now = Date.now();
+        const updates = {};
+
+        updates[`channels/${channelId}`] = {
+            name,
+            description,
+            type,
+            ownerUid: decoded.uid,
+            createdAt: now,
+            updatedAt: now
+        };
+
+        // Índice somente para canais públicos.
+        if (type === "public") {
+            updates[`publicChannels/${channelId}`] = {
+                name,
+                description,
+                createdAt: now
+            };
+        }
+
+        updates[`users/${decoded.uid}/channels/${channelId}`] = {
+            enabled: true,
+            addedAt: now
+        };
+
+        const userSnapshot = await db
+            .ref(`users/${decoded.uid}`)
+            .get();
+
+        const userProfile = userSnapshot.exists()
+            ? userSnapshot.val() || {}
+            : {};
+
+        if (!userProfile.defaultChannelId) {
+            updates[`users/${decoded.uid}/defaultChannelId`] = channelId;
+        }
+
+        await db.ref().update(updates);
+
+        console.log(
+            `[CHANNEL CREATE] uid=${decoded.uid} id=${channelId} type=${type} name=${name}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channel: {
+                id: channelId,
+                name,
+                description,
+                type,
+                ownerUid: decoded.uid,
+                enabled: true,
+                isDefault: !userProfile.defaultChannelId
+            }
+        });
+    } catch (error) {
+        console.error("[CHANNEL CREATE]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível criar o canal"
+        });
+    }
+}
+
+async function handleListUserChannels(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    try {
+        const data = await getUserChannels(decoded.uid);
+        sendHttpJson(res, 200, {
+            success: true,
+            channels: data.channels,
+            defaultChannelId: data.defaultChannelId
+        });
+    } catch (error) {
+        console.error("[CHANNEL LIST]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar os canais"
+        });
+    }
+}
+
+async function handleSearchPublicChannels(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    const url = new URL(
+        req.url,
+        `http://${req.headers.host || "localhost"}`
+    );
+
+    const query = String(
+        url.searchParams.get("q") || ""
+    )
+        .trim()
+        .toLowerCase();
+
+    if (query.length < 2) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Digite pelo menos 2 caracteres para pesquisar"
+        });
+        return;
+    }
+
+    try {
+        const snapshot = await db
+            .ref("publicChannels")
+            .get();
+
+        const all = snapshot.exists()
+            ? snapshot.val() || {}
+            : {};
+
+        const ownChannels = await db
+            .ref(`users/${decoded.uid}/channels`)
+            .get();
+
+        const own = ownChannels.exists()
+            ? ownChannels.val() || {}
+            : {};
+
+        const results = Object.entries(all)
+            .filter(([id, channel]) => {
+                const normalizedName = String(channel?.name || "")
+                    .toLowerCase();
+
+                return (
+                    normalizedName.includes(query) &&
+                    !Object.prototype.hasOwnProperty.call(own, id)
+                );
+            })
+            .slice(0, 50)
+            .map(([id, channel]) => ({
+                id,
+                name: channel?.name || "Canal",
+                description: channel?.description || "",
+                type: "public"
+            }));
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channels: results
+        });
+    } catch (error) {
+        console.error("[CHANNEL SEARCH]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível pesquisar os canais"
+        });
+    }
+}
+
+async function handleAddChannel(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(
+        body.channelId || ""
+    ).trim();
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const channelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const membershipRef = db
+            .ref(`users/${decoded.uid}/channels/${channelId}`);
+
+        const existingMembership = await membershipRef.get();
+
+        if (existingMembership.exists()) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Este canal já foi adicionado"
+            });
+            return;
+        }
+
+        const now = Date.now();
+        await membershipRef.set({
+            enabled: true,
+            addedAt: now
+        });
+
+        const userSnapshot = await db
+            .ref(`users/${decoded.uid}`)
+            .get();
+
+        const userProfile = userSnapshot.exists()
+            ? userSnapshot.val() || {}
+            : {};
+
+        let isDefault = false;
+
+        if (!userProfile.defaultChannelId) {
+            await db
+                .ref(`users/${decoded.uid}/defaultChannelId`)
+                .set(channelId);
+            isDefault = true;
+        }
+
+        console.log(
+            `[CHANNEL ADD] uid=${decoded.uid} id=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channel: {
+                id: channelId,
+                name: channel.name || "Canal",
+                description: channel.description || "",
+                type: channel.type || "private",
+                ownerUid: channel.ownerUid || "",
+                enabled: true,
+                isDefault
+            }
+        });
+    } catch (error) {
+        console.error("[CHANNEL ADD]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível adicionar o canal"
+        });
+    }
+}
+
+async function handleSetChannelEnabled(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const enabled = body.enabled === true;
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const membershipRef = db
+            .ref(`users/${decoded.uid}/channels/${channelId}`);
+
+        const snapshot = await membershipRef.get();
+
+        if (!snapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não está na sua lista"
+            });
+            return;
+        }
+
+        const membership = snapshot.val() || {};
+
+        await membershipRef.update({
+            enabled,
+            addedAt: Number(membership.addedAt || Date.now())
+        });
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            enabled
+        });
+    } catch (error) {
+        console.error("[CHANNEL ENABLE]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar o estado do canal"
+        });
+    }
+}
+
+async function handleSetDefaultChannel(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const membership = await db
+            .ref(`users/${decoded.uid}/channels/${channelId}`)
+            .get();
+
+        if (!membership.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não está na sua lista"
+            });
+            return;
+        }
+
+        await db
+            .ref(`users/${decoded.uid}/defaultChannelId`)
+            .set(channelId);
+
+        sendHttpJson(res, 200, {
+            success: true,
+            defaultChannelId: channelId
+        });
+    } catch (error) {
+        console.error("[CHANNEL DEFAULT]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível definir o canal padrão"
+        });
+    }
+}
+
+
+// ============================================================
 // SESSÕES
 // ============================================================
 //
@@ -608,6 +1206,7 @@ async function handleSessionOpen(
             }
 
         } catch (_) {
+            // Usa o nome do token se a leitura falhar.
         }
 
         sendHttpJson(
@@ -685,7 +1284,6 @@ async function handleSessionOpen(
 
     const newSession = {
         sessionId,
-
         deviceId,
 
         createdAt:
@@ -695,14 +1293,17 @@ async function handleSessionOpen(
             Date.now()
     };
 
+    /*
+     * Guarda a sessão nova.
+     */
     await sessionRef.set(
         newSession
     );
 
-    // ========================================================
-    // REVOGA CONEXÃO ANTERIOR
-    // ========================================================
-
+    /*
+     * Se já havia WebSocket da sessão anterior,
+     * avisa e derruba o dispositivo antigo.
+     */
     const oldWs =
         clients.get(
             uid
@@ -739,10 +1340,6 @@ async function handleSessionOpen(
         } catch (_) {
         }
     }
-
-    // ========================================================
-    // NOME OFICIAL
-    // ========================================================
 
     let username =
         decoded.name ||
@@ -859,8 +1456,7 @@ function normalizeUsername(
 ) {
 
     return String(
-        username ||
-        ""
+        username || ""
     )
         .trim()
         .toLowerCase()
@@ -937,9 +1533,7 @@ const RATE_LIMIT_WINDOW =
 const RATE_LIMIT_MAX =
     30;
 
-function getRequestIp(
-    req
-) {
+function getRequestIp(req) {
 
     const forwarded =
         req.headers[
@@ -1335,7 +1929,6 @@ async function handleCheckRegistration(
                 !emailExists,
 
             usernameExists,
-
             emailExists
         }
     );
@@ -1529,7 +2122,6 @@ async function handleReserveUsername(
                     ) {
 
                         return {
-
                             reservationId,
 
                             expiresAt:
@@ -1550,7 +2142,6 @@ async function handleReserveUsername(
                     ) {
 
                         return {
-
                             reservationId,
 
                             expiresAt:
@@ -2297,6 +2888,120 @@ const httpServer =
                 return;
             }
 
+            // ------------------------------------------------
+            // CHANNEL LIST
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "GET" &&
+                req.url.split("?")[0] ===
+                    "/api/channels/mine"
+            ) {
+
+                await handleListUserChannels(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL SEARCH
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "GET" &&
+                req.url.split("?")[0] ===
+                    "/api/channels/search"
+            ) {
+
+                await handleSearchPublicChannels(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL CREATE
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/create"
+            ) {
+
+                await handleCreateChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL ADD
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/add"
+            ) {
+
+                await handleAddChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL ENABLE/DISABLE
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/set-enabled"
+            ) {
+
+                await handleSetChannelEnabled(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL DEFAULT
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/set-default"
+            ) {
+
+                await handleSetDefaultChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
             sendHttpJson(
                 res,
                 404,
@@ -2328,9 +3033,7 @@ const wss =
 // WEBSOCKET UTILITIES
 // ============================================================
 
-function isOpen(
-    ws
-) {
+function isOpen(ws) {
 
     return (
         ws &&
@@ -2349,7 +3052,6 @@ function clientList() {
         )
         .map(
             ws => ({
-
                 id:
                     ws.userId,
 
@@ -2367,7 +3069,6 @@ function sendJson(
     if (
         !isOpen(ws)
     ) {
-
         return;
     }
 
@@ -2665,61 +3366,15 @@ async function handleJson(
         ws.deviceId =
             deviceId;
 
-        /*
-         * O nome público agora vem do Firebase.
-         * O cliente não pode escolher o nome.
-         */
         ws.name =
-            "Anônimo";
-
-        if (
-            db
-        ) {
-
-            try {
-
-                const profile =
-                    await db
-                        .ref(
-                            `users/${userId}`
-                        )
-                        .get();
-
-                if (
-                    profile.exists()
-                ) {
-
-                    ws.name =
-                        String(
-                            profile.val()?.username ||
-                            "Anônimo"
-                        ).slice(
-                            0,
-                            32
-                        );
-                }
-
-            } catch (error) {
-
-                console.error(
-                    `[IDENTIFY] erro buscando username: ${error.message}`
-                );
-
-                try {
-
-                    ws.name =
-                        String(
-                            decoded.name ||
-                            "Anônimo"
-                        ).slice(
-                            0,
-                            32
-                        );
-
-                } catch (_) {
-                }
-            }
-        }
+            String(
+                data.name ||
+                    decoded.name ||
+                    "Anônimo"
+            ).slice(
+                0,
+                32
+            );
 
         clients.set(
             userId,
@@ -2769,7 +3424,6 @@ async function handleJson(
                 activeTransmitter:
                     activeTransmitterId
                         ? {
-
                             id:
                                 activeTransmitterId,
 
@@ -2808,10 +3462,6 @@ async function handleJson(
     // ========================================================
     // UPDATE NAME
     // ========================================================
-    //
-    // O nome de usuário é permanente.
-    // Qualquer mensagem antiga "update_name" é ignorada.
-    //
 
     if (
         data.type ===
