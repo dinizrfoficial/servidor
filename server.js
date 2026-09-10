@@ -280,6 +280,49 @@ async function getUserProfile(uid) {
     return snapshot.exists() ? snapshot.val() || {} : {};
 }
 
+function getChannelAdminUids(channel) {
+    const admins =
+        channel && typeof channel.admins === "object" && channel.admins
+            ? channel.admins
+            : {};
+
+    return Object.keys(admins).filter(uid => String(uid || "").trim());
+}
+
+function isChannelOwnerUser(channel, uid) {
+    return String(channel?.ownerUid || "") === String(uid || "");
+}
+
+function isChannelDelegatedAdmin(channel, uid) {
+    const normalizedUid = String(uid || "");
+    return (
+        !!normalizedUid &&
+        !!channel?.admins &&
+        Object.prototype.hasOwnProperty.call(channel.admins, normalizedUid)
+    );
+}
+
+function canModerateChannel(channel, uid) {
+    return (
+        isChannelOwnerUser(channel, uid) ||
+        isChannelDelegatedAdmin(channel, uid)
+    );
+}
+
+function updateInMemoryChannelAdmins(channelId, channel) {
+    const adminUids = getChannelAdminUids(channel);
+
+    for (const ws of clients.values()) {
+        const item = Array.isArray(ws.channels)
+            ? ws.channels.find(entry => String(entry.id) === String(channelId))
+            : null;
+
+        if (item) {
+            item.adminUids = adminUids;
+        }
+    }
+}
+
 async function getUserChannels(uid) {
     const membershipSnapshot = await db
         .ref(`users/${uid}/channels`)
@@ -314,6 +357,7 @@ async function getUserChannels(uid) {
             description: channel.description || "",
             type: channel.type || "public",
             ownerUid: channel.ownerUid || "",
+            adminUids: getChannelAdminUids(channel),
             avatar: sanitizeAvatar(channel.avatar),
             blocked,
             enabled: !blocked && membership?.enabled !== false,
@@ -1385,15 +1429,34 @@ async function handleRemoveChannel(req, res) {
             resetTransmitterIf(decoded.uid);
         }
 
+        const wasDelegatedAdmin =
+            isChannelDelegatedAdmin(channel, decoded.uid);
+
         const updates = {
             [`users/${decoded.uid}/channels/${channelId}`]: null
         };
+
+        if (wasDelegatedAdmin) {
+            updates[`channels/${channelId}/admins/${decoded.uid}`] = null;
+        }
 
         if (String(profile.defaultChannelId || "") === channelId) {
             updates[`users/${decoded.uid}/defaultChannelId`] = null;
         }
 
         await db.ref().update(updates);
+
+        if (wasDelegatedAdmin) {
+            const refreshedChannelSnapshot = await db
+                .ref(`channels/${channelId}`)
+                .get();
+            if (refreshedChannelSnapshot.exists()) {
+                updateInMemoryChannelAdmins(
+                    channelId,
+                    refreshedChannelSnapshot.val() || {}
+                );
+            }
+        }
 
         await refreshConnectedClientChannels(decoded.uid);
         broadcastUserLists();
@@ -1452,6 +1515,40 @@ async function getOwnedChannelOrRespond(res, ownerUid, channelId) {
         sendHttpJson(res, 403, {
             success: false,
             error: "Somente o administrador do canal pode executar esta ação"
+        });
+        return null;
+    }
+
+    return channel;
+}
+
+async function getManagedChannelOrRespond(res, actorUid, channelId) {
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return null;
+    }
+
+    const snapshot = await db
+        .ref(`channels/${channelId}`)
+        .get();
+
+    if (!snapshot.exists()) {
+        sendHttpJson(res, 404, {
+            success: false,
+            error: "Canal não encontrado"
+        });
+        return null;
+    }
+
+    const channel = snapshot.val() || {};
+
+    if (!canModerateChannel(channel, actorUid)) {
+        sendHttpJson(res, 403, {
+            success: false,
+            error: "Você não tem permissão para administrar usuários deste canal"
         });
         return null;
     }
@@ -1633,12 +1730,32 @@ async function handleBlockChannelUser(req, res) {
     }
 
     try {
-        const channel = await getOwnedChannelOrRespond(
+        const channel = await getManagedChannelOrRespond(
             res,
             decoded.uid,
             channelId
         );
         if (!channel) return;
+
+        const actorIsOwner = isChannelOwnerUser(channel, decoded.uid);
+        const targetIsOwner = isChannelOwnerUser(channel, targetUid);
+        const targetIsAdmin = isChannelDelegatedAdmin(channel, targetUid);
+
+        if (targetIsOwner) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "O criador do canal não pode ser bloqueado"
+            });
+            return;
+        }
+
+        if (!actorIsOwner && targetIsAdmin) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "Um administrador não pode bloquear outro administrador"
+            });
+            return;
+        }
 
         const membershipRef = db.ref(
             `users/${targetUid}/channels/${channelId}`
@@ -1662,6 +1779,11 @@ async function handleBlockChannelUser(req, res) {
             blockedAt: now,
             blockedBy: decoded.uid
         };
+
+        if (actorIsOwner && targetIsAdmin) {
+            updates[`channels/${channelId}/admins/${targetUid}`] = null;
+        }
+
         updates[`channels/${channelId}/updatedAt`] = now;
         updates[`users/${targetUid}/channels/${channelId}/enabled`] = false;
         updates[`users/${targetUid}/channels/${channelId}/addedAt`] =
@@ -1672,6 +1794,18 @@ async function handleBlockChannelUser(req, res) {
         }
 
         await db.ref().update(updates);
+
+        if (actorIsOwner && targetIsAdmin) {
+            const refreshedChannelSnapshot = await db
+                .ref(`channels/${channelId}`)
+                .get();
+            if (refreshedChannelSnapshot.exists()) {
+                updateInMemoryChannelAdmins(
+                    channelId,
+                    refreshedChannelSnapshot.val() || {}
+                );
+            }
+        }
 
         resetTransmitterIf(targetUid);
 
@@ -1754,7 +1888,7 @@ async function handleUnblockChannelUser(req, res) {
     }
 
     try {
-        const channel = await getOwnedChannelOrRespond(
+        const channel = await getManagedChannelOrRespond(
             res,
             decoded.uid,
             channelId
@@ -1791,6 +1925,138 @@ async function handleUnblockChannelUser(req, res) {
     }
 }
 
+async function handleMakeChannelAdmin(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    try {
+        const channel = await getOwnedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        if (targetUid === decoded.uid) {
+            sendHttpJson(res, 400, {
+                success: false,
+                error: "Você já é o administrador principal deste canal"
+            });
+            return;
+        }
+
+        if (
+            channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                targetUid
+            )
+        ) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Desbloqueie este usuário antes de torná-lo administrador"
+            });
+            return;
+        }
+
+        const membership = await db
+            .ref(`users/${targetUid}/channels/${channelId}`)
+            .get();
+
+        if (!membership.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Este usuário não participa do canal"
+            });
+            return;
+        }
+
+        const now = Date.now();
+
+        await db.ref().update({
+            [`channels/${channelId}/admins/${targetUid}`]: {
+                addedAt: now,
+                addedBy: decoded.uid,
+                permissions: {
+                    blockUsers: true,
+                    unblockUsers: true
+                }
+            },
+            [`channels/${channelId}/updatedAt`]: now
+        });
+
+        const refreshedChannelSnapshot = await db
+            .ref(`channels/${channelId}`)
+            .get();
+
+        if (refreshedChannelSnapshot.exists()) {
+            updateInMemoryChannelAdmins(
+                channelId,
+                refreshedChannelSnapshot.val() || {}
+            );
+        }
+
+        await refreshConnectedClientChannels(targetUid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL MAKE ADMIN] owner=${decoded.uid} ` +
+            `target=${targetUid} channel=${channelId}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL MAKE ADMIN]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível tornar o usuário administrador"
+        });
+    }
+}
+
 async function handleListBlockedChannelUsers(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -1820,7 +2086,7 @@ async function handleListBlockedChannelUsers(req, res) {
     ).trim();
 
     try {
-        const channel = await getOwnedChannelOrRespond(
+        const channel = await getManagedChannelOrRespond(
             res,
             decoded.uid,
             channelId
@@ -4398,6 +4664,14 @@ const httpServer =
 
             if (
                 req.method === "POST" &&
+                req.url === "/api/channels/make-admin"
+            ) {
+                await handleMakeChannelAdmin(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
                 req.url === "/api/channels/unblock-user"
             ) {
                 await handleUnblockChannelUser(req, res);
@@ -4506,15 +4780,35 @@ function clientListFor(ws) {
         return [];
     }
 
+    const channel = Array.isArray(ws?.channels)
+        ? ws.channels.find(item => String(item.id) === String(channelId))
+        : null;
+
+    const ownerUid = String(channel?.ownerUid || "");
+    const adminUids = new Set(
+        Array.isArray(channel?.adminUids)
+            ? channel.adminUids.map(value => String(value))
+            : []
+    );
+
     return [
         ...clients.values()
     ]
         .filter(client => isClientOnChannel(client, channelId))
-        .map(client => ({
-            id: client.userId,
-            name: client.name,
-            avatar: client.avatar || ""
-        }));
+        .map(client => {
+            const clientUid = String(client.userId || "");
+            const isOwner = !!clientUid && clientUid === ownerUid;
+            const isAdmin = isOwner || adminUids.has(clientUid);
+
+            return {
+                id: client.userId,
+                name: client.name,
+                avatar: client.avatar || "",
+                isOwner,
+                isAdmin,
+                role: isOwner ? "owner" : (isAdmin ? "admin" : "user")
+            };
+        });
 }
 
 function sendJson(
