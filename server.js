@@ -166,24 +166,24 @@ const clients =
     new Map();
 
 // ============================================================
-// TRANSMISSOR
+// TRANSMISSORES POR CANAL
 // ============================================================
+//
+// channelId -> {
+//   userId,
+//   name,
+//   startedAt,
+//   audioPacketCount,
+//   audioBytesRelayed
+// }
+//
+// Cada canal possui seu próprio PTT ocupado/livre.
+// Isso permite transmissões simultâneas em canais diferentes
+// sem enviar áudio para usuários que não participam do canal.
+//
 
-let activeTransmitterId =
-    null;
-
-let activeTransmitStartedAt =
-    0;
-
-// ============================================================
-// ÁUDIO
-// ============================================================
-
-let audioPacketCount =
-    0;
-
-let audioBytesRelayed =
-    0;
+const activeTransmitters =
+    new Map();
 
 // ============================================================
 // PROTOCOLO DE ÁUDIO
@@ -299,6 +299,82 @@ async function getUserChannels(uid) {
     };
 }
 
+// ============================================================
+// ESTADO DE CANAIS PARA O WEBSOCKET
+// ============================================================
+
+async function loadClientChannelState(uid) {
+    const data = await getUserChannels(uid);
+
+    const enabledChannelIds = new Set(
+        data.channels
+            .filter(channel => channel.enabled === true)
+            .map(channel => String(channel.id))
+    );
+
+    let defaultChannelId = data.defaultChannelId
+        ? String(data.defaultChannelId)
+        : null;
+
+    // Canal padrão desligado não pode transmitir.
+    if (
+        defaultChannelId &&
+        !enabledChannelIds.has(defaultChannelId)
+    ) {
+        defaultChannelId = null;
+    }
+
+    return {
+        channels: data.channels,
+        enabledChannelIds,
+        defaultChannelId
+    };
+}
+
+async function refreshConnectedClientChannels(uid) {
+    const ws = clients.get(uid);
+
+    if (!ws || !isOpen(ws)) {
+        return;
+    }
+
+    try {
+        const state = await loadClientChannelState(uid);
+
+        const previousTxChannelId = ws.txChannelId || null;
+
+        ws.channels = state.channels;
+        ws.enabledChannelIds = state.enabledChannelIds;
+        ws.defaultChannelId = state.defaultChannelId;
+
+        // Se o canal usado na transmissão deixou de estar ativo ou
+        // deixou de ser o padrão, encerramos a transmissão imediatamente.
+        if (
+            previousTxChannelId &&
+            (
+                !ws.enabledChannelIds.has(previousTxChannelId) ||
+                ws.defaultChannelId !== previousTxChannelId
+            )
+        ) {
+            resetTransmitterIf(uid);
+
+            sendJson(ws, {
+                type: "tx_denied",
+                code: "CHANNEL_CHANGED",
+                message: "O canal de transmissão foi alterado."
+            });
+        }
+
+        sendJson(ws, buildChannelStateMessage(ws));
+        broadcastUserLists();
+
+    } catch (error) {
+        console.error(
+            `[CHANNEL WS REFRESH] uid=${uid} ${error.message}`
+        );
+    }
+}
+
 async function handleCreateChannel(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -383,6 +459,8 @@ async function handleCreateChannel(req, res) {
         }
 
         await db.ref().update(updates);
+
+        await refreshConnectedClientChannels(decoded.uid);
 
         console.log(
             `[CHANNEL CREATE] uid=${decoded.uid} id=${channelId} type=${type} name=${name}`
@@ -625,6 +703,8 @@ async function handleAddChannel(req, res) {
             isDefault = true;
         }
 
+        await refreshConnectedClientChannels(decoded.uid);
+
         console.log(
             `[CHANNEL ADD] uid=${decoded.uid} id=${channelId}`
         );
@@ -713,6 +793,23 @@ async function handleSetChannelEnabled(req, res) {
             addedAt: Number(membership.addedAt || Date.now())
         });
 
+        // Um canal desligado não pode continuar sendo o canal padrão.
+        if (!enabled) {
+            const defaultRef = db
+                .ref(`users/${decoded.uid}/defaultChannelId`);
+
+            const defaultSnapshot = await defaultRef.get();
+
+            if (
+                defaultSnapshot.exists() &&
+                String(defaultSnapshot.val() || "") === channelId
+            ) {
+                await defaultRef.set(null);
+            }
+        }
+
+        await refreshConnectedClientChannels(decoded.uid);
+
         sendHttpJson(res, 200, {
             success: true,
             channelId,
@@ -781,9 +878,21 @@ async function handleSetDefaultChannel(req, res) {
             return;
         }
 
+        const membershipData = membership.val() || {};
+
+        if (membershipData.enabled === false) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Ative o canal antes de defini-lo como padrão"
+            });
+            return;
+        }
+
         await db
             .ref(`users/${decoded.uid}/defaultChannelId`)
             .set(channelId);
+
+        await refreshConnectedClientChannels(decoded.uid);
 
         sendHttpJson(res, 200, {
             success: true,
@@ -3042,46 +3151,53 @@ function isOpen(ws) {
     );
 }
 
-function clientList() {
+function shareAnyEnabledChannel(a, b) {
+    if (!a || !b) {
+        return false;
+    }
 
+    const aChannels = a.enabledChannelIds || new Set();
+    const bChannels = b.enabledChannelIds || new Set();
+
+    // O próprio usuário continua aparecendo na lista mesmo sem canal.
+    if (a.userId && a.userId === b.userId) {
+        return true;
+    }
+
+    for (const channelId of aChannels) {
+        if (bChannels.has(channelId)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function clientListFor(ws) {
     return [
         ...clients.values()
     ]
-        .filter(
-            isOpen
-        )
-        .map(
-            ws => ({
-                id:
-                    ws.userId,
-
-                name:
-                    ws.name
-            })
-        );
+        .filter(isOpen)
+        .filter(client => shareAnyEnabledChannel(ws, client))
+        .map(client => ({
+            id: client.userId,
+            name: client.name
+        }));
 }
 
 function sendJson(
     ws,
     data
 ) {
-
-    if (
-        !isOpen(ws)
-    ) {
+    if (!isOpen(ws)) {
         return;
     }
 
     try {
-
         ws.send(
-            JSON.stringify(
-                data
-            )
+            JSON.stringify(data)
         );
-
     } catch (error) {
-
         console.error(
             `[JSON TX ERROR] ${error.message}`
         );
@@ -3092,37 +3208,89 @@ function broadcastJson(
     data,
     exceptId = null
 ) {
+    const payload = JSON.stringify(data);
 
-    const payload =
-        JSON.stringify(
-            data
-        );
-
-    for (
-        const ws
-        of clients.values()
-    ) {
-
+    for (const ws of clients.values()) {
         if (
             isOpen(ws) &&
-            ws.userId !==
-                exceptId
+            ws.userId !== exceptId
         ) {
-
             try {
-
-                ws.send(
-                    payload
-                );
-
+                ws.send(payload);
             } catch (error) {
-
                 console.error(
                     `[BROADCAST ERROR] ${error.message}`
                 );
             }
         }
     }
+}
+
+function broadcastJsonToChannel(
+    channelId,
+    data,
+    exceptId = null
+) {
+    const payload = JSON.stringify(data);
+
+    for (const ws of clients.values()) {
+        if (
+            !isOpen(ws) ||
+            ws.userId === exceptId ||
+            !ws.enabledChannelIds?.has(channelId)
+        ) {
+            continue;
+        }
+
+        try {
+            ws.send(payload);
+        } catch (error) {
+            console.error(
+                `[CHANNEL BROADCAST ERROR] channel=${channelId} ` +
+                `user=${ws.userId} ${error.message}`
+            );
+        }
+    }
+}
+
+function broadcastUserLists() {
+    for (const ws of clients.values()) {
+        if (!isOpen(ws)) {
+            continue;
+        }
+
+        sendJson(ws, {
+            type: "user_list",
+            clients: clientListFor(ws)
+        });
+    }
+}
+
+function activeTransmittersForClient(ws) {
+    const result = [];
+
+    for (const [channelId, state] of activeTransmitters) {
+        if (!ws.enabledChannelIds?.has(channelId)) {
+            continue;
+        }
+
+        result.push({
+            channelId,
+            id: state.userId,
+            name: state.name || state.userId
+        });
+    }
+
+    return result;
+}
+
+function buildChannelStateMessage(ws) {
+    return {
+        type: "channel_state",
+        channels: Array.isArray(ws.channels) ? ws.channels : [],
+        defaultChannelId: ws.defaultChannelId || null,
+        activeTransmitters: activeTransmittersForClient(ws)
+    };
 }
 
 // ============================================================
@@ -3132,17 +3300,12 @@ function broadcastJson(
 function isAudioPacket(
     buf
 ) {
-
     return (
         Buffer.isBuffer(buf) &&
-        buf.length >
-            AUDIO_HEADER_SIZE &&
-        buf[0] ===
-            AUDIO_MAGIC_0 &&
-        buf[1] ===
-            AUDIO_MAGIC_1 &&
-        buf[2] ===
-            AUDIO_VERSION
+        buf.length > AUDIO_HEADER_SIZE &&
+        buf[0] === AUDIO_MAGIC_0 &&
+        buf[1] === AUDIO_MAGIC_1 &&
+        buf[2] === AUDIO_VERSION
     );
 }
 
@@ -3153,32 +3316,36 @@ function isAudioPacket(
 function resetTransmitterIf(
     userId
 ) {
+    const stopped = [];
 
-    if (
-        activeTransmitterId !==
-        userId
-    ) {
+    for (const [channelId, state] of activeTransmitters) {
+        if (state.userId !== userId) {
+            continue;
+        }
 
-        return;
+        activeTransmitters.delete(channelId);
+        stopped.push({ channelId, state });
+
+        console.log(
+            `[TX RESET] user=${userId} channel=${channelId}`
+        );
+
+        broadcastJsonToChannel(
+            channelId,
+            {
+                type: "stop_tx",
+                from: userId,
+                channelId
+            }
+        );
     }
 
-    console.log(
-        `[TX RESET] ${userId}`
-    );
+    const ws = clients.get(userId);
+    if (ws) {
+        ws.txChannelId = null;
+    }
 
-    activeTransmitterId =
-        null;
-
-    activeTransmitStartedAt =
-        0;
-
-    broadcastJson({
-        type:
-            "stop_tx",
-
-        from:
-            userId
-    });
+    return stopped;
 }
 
 // ============================================================
@@ -3376,6 +3543,32 @@ async function handleJson(
                 32
             );
 
+        try {
+            const channelState =
+                await loadClientChannelState(userId);
+
+            ws.channels =
+                channelState.channels;
+
+            ws.enabledChannelIds =
+                channelState.enabledChannelIds;
+
+            ws.defaultChannelId =
+                channelState.defaultChannelId;
+
+        } catch (error) {
+            console.error(
+                `[IDENTIFY CHANNELS] uid=${userId} ${error.message}`
+            );
+
+            ws.channels = [];
+            ws.enabledChannelIds = new Set();
+            ws.defaultChannelId = null;
+        }
+
+        ws.txChannelId =
+            null;
+
         clients.set(
             userId,
             ws
@@ -3409,6 +3602,9 @@ async function handleJson(
             `usuários=${clients.size}`
         );
 
+        const activeForClient =
+            activeTransmittersForClient(ws);
+
         sendJson(
             ws,
             {
@@ -3419,31 +3615,30 @@ async function handleJson(
                     userId,
 
                 clients:
-                    clientList(),
+                    clientListFor(ws),
 
+                channels:
+                    ws.channels,
+
+                defaultChannelId:
+                    ws.defaultChannelId || null,
+
+                activeTransmitters:
+                    activeForClient,
+
+                // Compatibilidade com versões antigas do Android.
                 activeTransmitter:
-                    activeTransmitterId
+                    activeForClient.length > 0
                         ? {
-                            id:
-                                activeTransmitterId,
-
-                            name:
-                                clients.get(
-                                    activeTransmitterId
-                                )?.name ||
-                                activeTransmitterId
+                            id: activeForClient[0].id,
+                            name: activeForClient[0].name,
+                            channelId: activeForClient[0].channelId
                         }
                         : null
             }
         );
 
-        broadcastJson({
-            type:
-                "user_list",
-
-            clients:
-                clientList()
-        });
+        broadcastUserLists();
 
         return;
     }
@@ -3483,65 +3678,114 @@ async function handleJson(
         data.type ===
         "start_tx"
     ) {
+        const channelId =
+            ws.defaultChannelId || null;
 
         if (
-            activeTransmitterId &&
-            activeTransmitterId !==
-                ws.userId
+            !channelId ||
+            !ws.enabledChannelIds?.has(channelId)
         ) {
-
-            const activeName =
-                clients.get(
-                    activeTransmitterId
-                )?.name ||
-                activeTransmitterId;
-
-            console.log(
-                `[TX DENIED] ${ws.userId} ` +
-                `tentou transmitir; ` +
-                `canal ocupado por ${activeTransmitterId}`
-            );
-
             sendJson(
                 ws,
                 {
-                    type:
-                        "tx_denied",
-
-                    name:
-                        activeName
+                    type: "tx_denied",
+                    code: "NO_DEFAULT_CHANNEL",
+                    message: "Selecione um canal padrão ativo antes de transmitir."
                 }
             );
 
             return;
         }
 
-        activeTransmitterId =
-            ws.userId;
+        const requestedChannelId =
+            String(data.channelId || "").trim();
 
-        activeTransmitStartedAt =
-            Date.now();
+        // O cliente não pode escolher um canal diferente do padrão
+        // apenas alterando a mensagem WebSocket.
+        if (
+            requestedChannelId &&
+            requestedChannelId !== channelId
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "INVALID_CHANNEL",
+                    message: "O PTT só pode transmitir no canal padrão."
+                }
+            );
 
-        audioPacketCount =
-            0;
+            return;
+        }
 
-        audioBytesRelayed =
-            0;
+        const active =
+            activeTransmitters.get(channelId);
 
-        console.log(
-            `[TX START] ${ws.userId} (${ws.name})`
+        if (
+            active &&
+            active.userId !== ws.userId
+        ) {
+            console.log(
+                `[TX DENIED] ${ws.userId} tentou transmitir ` +
+                `channel=${channelId}; ocupado por ${active.userId}`
+            );
+
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "CHANNEL_BUSY",
+                    channelId,
+                    name: active.name || active.userId,
+                    message: "Canal ocupado"
+                }
+            );
+
+            return;
+        }
+
+        // Um mesmo usuário transmite em apenas um canal por vez.
+        if (
+            ws.txChannelId &&
+            ws.txChannelId !== channelId
+        ) {
+            resetTransmitterIf(ws.userId);
+        }
+
+        const state = {
+            userId: ws.userId,
+            name: ws.name,
+            startedAt: Date.now(),
+            audioPacketCount: 0,
+            audioBytesRelayed: 0
+        };
+
+        activeTransmitters.set(
+            channelId,
+            state
         );
 
-        broadcastJson({
-            type:
-                "start_tx",
+        ws.txChannelId =
+            channelId;
 
-            from:
-                ws.userId,
+        const channel =
+            (ws.channels || [])
+                .find(item => String(item.id) === channelId);
 
-            name:
-                ws.name
-        });
+        console.log(
+            `[TX START] ${ws.userId} (${ws.name}) channel=${channelId}`
+        );
+
+        broadcastJsonToChannel(
+            channelId,
+            {
+                type: "start_tx",
+                from: ws.userId,
+                name: ws.name,
+                channelId,
+                channelName: channel?.name || "Canal"
+            }
+        );
 
         return;
     }
@@ -3554,20 +3798,30 @@ async function handleJson(
         data.type ===
         "stop_tx"
     ) {
+        const channelId =
+            ws.txChannelId || ws.defaultChannelId || null;
 
-        const duration =
-            activeTransmitStartedAt >
-            0
-                ? Date.now() -
-                    activeTransmitStartedAt
-                : 0;
+        const state = channelId
+            ? activeTransmitters.get(channelId)
+            : null;
 
-        console.log(
-            `[TX STOP] ${ws.userId} (${ws.name}) | ` +
-            `pacotes: ${audioPacketCount} | ` +
-            `bytes: ${audioBytesRelayed} | ` +
-            `duração: ${duration} ms`
-        );
+        if (
+            state &&
+            state.userId === ws.userId
+        ) {
+            const duration =
+                state.startedAt > 0
+                    ? Date.now() - state.startedAt
+                    : 0;
+
+            console.log(
+                `[TX STOP] ${ws.userId} (${ws.name}) | ` +
+                `channel=${channelId} | ` +
+                `pacotes=${state.audioPacketCount} | ` +
+                `bytes=${state.audioBytesRelayed} | ` +
+                `duração=${duration} ms`
+            );
+        }
 
         resetTransmitterIf(
             ws.userId
@@ -3622,6 +3876,18 @@ wss.on(
         ws.name =
             "Anônimo";
 
+        ws.channels =
+            [];
+
+        ws.enabledChannelIds =
+            new Set();
+
+        ws.defaultChannelId =
+            null;
+
+        ws.txChannelId =
+            null;
+
         ws.isAlive =
             true;
 
@@ -3650,57 +3916,56 @@ wss.on(
                         data
                     )
                 ) {
+                    const channelId =
+                        ws.txChannelId || null;
+
+                    const txState =
+                        channelId
+                            ? activeTransmitters.get(channelId)
+                            : null;
 
                     if (
                         !ws.userId ||
                         !ws.sessionId ||
-                        activeTransmitterId !==
-                            ws.userId
+                        !channelId ||
+                        !txState ||
+                        txState.userId !== ws.userId ||
+                        !ws.enabledChannelIds?.has(channelId)
                     ) {
-
                         console.warn(
                             `[AUDIO DROP] pacote rejeitado ` +
-                            `user=${ws.userId || "não identificado"}`
+                            `user=${ws.userId || "não identificado"} ` +
+                            `channel=${channelId || "nenhum"}`
                         );
 
                         return;
                     }
 
-                    audioPacketCount++;
+                    txState.audioPacketCount++;
+                    txState.audioBytesRelayed += data.length;
 
-                    audioBytesRelayed +=
-                        data.length;
+                    let delivered = 0;
 
-                    let delivered =
-                        0;
-
-                    for (
-                        const client
-                        of clients.values()
-                    ) {
-
+                    for (const client of clients.values()) {
                         if (
                             isOpen(client) &&
-                            client.userId !==
-                                ws.userId
+                            client.userId !== ws.userId &&
+                            client.enabledChannelIds?.has(channelId)
                         ) {
-
                             try {
-
                                 client.send(
                                     data,
                                     {
-                                        binary:
-                                            true
+                                        binary: true
                                     }
                                 );
 
                                 delivered++;
 
                             } catch (error) {
-
                                 console.error(
                                     `[AUDIO TX ERROR] ` +
+                                    `channel=${channelId} ` +
                                     `para=${client.userId} ` +
                                     `${error.message}`
                                 );
@@ -3709,20 +3974,16 @@ wss.on(
                     }
 
                     if (
-                        audioPacketCount ===
-                            1 ||
-                        audioPacketCount %
-                            100 ===
-                            0
+                        txState.audioPacketCount === 1 ||
+                        txState.audioPacketCount % 100 === 0
                     ) {
-
                         const opusSize =
-                            data.length -
-                            AUDIO_HEADER_SIZE;
+                            data.length - AUDIO_HEADER_SIZE;
 
                         console.log(
-                            `[AUDIO] RX #${audioPacketCount} ` +
+                            `[AUDIO] RX #${txState.audioPacketCount} ` +
                             `de=${ws.userId} ` +
+                            `channel=${channelId} ` +
                             `bytes=${data.length} ` +
                             `opus=${opusSize} ` +
                             `destinatarios=${delivered}`
@@ -3817,13 +4078,7 @@ wss.on(
                     ws.userId
                 );
 
-                broadcastJson({
-                    type:
-                        "user_list",
-
-                    clients:
-                        clientList()
-                });
+                broadcastUserLists();
             }
         );
 
@@ -3929,25 +4184,22 @@ httpServer.listen(
 
 setInterval(
     () => {
+        let packetCount = 0;
+        let byteCount = 0;
 
-        if (
-            audioPacketCount >
-            0
-        ) {
-
-            console.log(
-                `[AUDIO STATS] ` +
-                `pacotes=${audioPacketCount} ` +
-                `bytes=${audioBytesRelayed}`
-            );
-
-            audioPacketCount =
-                0;
-
-            audioBytesRelayed =
-                0;
+        for (const state of activeTransmitters.values()) {
+            packetCount += Number(state.audioPacketCount || 0);
+            byteCount += Number(state.audioBytesRelayed || 0);
         }
 
+        if (packetCount > 0) {
+            console.log(
+                `[AUDIO STATS] ` +
+                `canaisAtivos=${activeTransmitters.size} ` +
+                `pacotes=${packetCount} ` +
+                `bytes=${byteCount}`
+            );
+        }
     },
     60_000
 );
