@@ -215,6 +215,17 @@ const AUDIO_HEADER_SIZE =
 const LATE_JOIN_BOOTSTRAP_PACKETS =
     5;
 
+/*
+ * Janela usada somente para decidir quando dois canais começaram
+ * praticamente ao mesmo tempo.
+ *
+ * Fora desta janela vale a ordem real de início da transmissão.
+ * Dentro dela, o canal padrão do usuário tem prioridade; se o padrão
+ * não estiver entre os candidatos, o vencedor é escolhido aleatoriamente.
+ */
+const RX_SIMULTANEOUS_WINDOW_MS =
+    60;
+
 // ============================================================
 // CANAIS
 // ============================================================
@@ -534,23 +545,47 @@ async function refreshConnectedClientChannels(uid) {
                     : null;
         }
 
-        // A transmissão só é encerrada se o canal usado deixou de estar
-        // habilitado ou deixou de ser o canal atualmente selecionado.
+        /*
+         * TX é sempre no canal padrão quando há vários canais ativos.
+         * Se existir somente um canal ativo, ele pode ser usado mesmo
+         * sem default explícito.
+         */
+        const allowedTxChannel =
+            preferredTxChannelForClient(ws);
+
         if (
             previousTxChannelId &&
-            (
-                !ws.enabledChannelIds.has(previousTxChannelId) ||
-                ws.activeChannelId !== previousTxChannelId
-            )
+            previousTxChannelId !== allowedTxChannel
         ) {
             resetTransmitterIf(uid);
 
             sendJson(ws, {
                 type: "tx_denied",
                 code: "CHANNEL_CHANGED",
-                message: "O canal de transmissão foi alterado."
+                message: "O canal padrão de transmissão foi alterado."
             });
         }
+
+        /*
+         * Se o canal que estava sendo ouvido deixou de estar marcado,
+         * abandona-o e escolhe a próxima transmissão válida.
+         */
+        if (
+            ws.rxChannelId &&
+            !ws.enabledChannelIds.has(ws.rxChannelId)
+        ) {
+            sendJson(ws, {
+                type: "stop_tx",
+                from: activeTransmitters.get(ws.rxChannelId)?.userId || "",
+                channelId: ws.rxChannelId
+            });
+            ws.rxChannelId = null;
+        }
+
+        ensureReceiveSelectionNow(
+            ws,
+            false
+        );
 
         sendJson(ws, buildChannelStateMessage(ws));
         broadcastUserLists();
@@ -4993,16 +5028,33 @@ function isOpen(ws) {
 }
 
 function isClientOnChannel(client, channelId) {
+    /*
+     * "Participar" de um canal agora significa tê-lo marcado/ativo.
+     * activeChannelId continua existindo apenas para a tela que o usuário
+     * abriu e para escolher qual lista de usuários mostrar.
+     */
     return (
         isOpen(client) &&
         !!channelId &&
-        client.activeChannelId === channelId &&
         client.enabledChannelIds?.has(channelId)
     );
 }
 
+function uiChannelIdForClient(ws) {
+    return (
+        ws?.activeChannelId ||
+        ws?.defaultChannelId ||
+        (
+            ws?.enabledChannelIds
+                ? [...ws.enabledChannelIds][0] || null
+                : null
+        )
+    );
+}
+
 function clientListFor(ws) {
-    const channelId = ws?.activeChannelId || null;
+    const channelId =
+        uiChannelIdForClient(ws);
 
     if (!channelId) {
         return [];
@@ -5167,32 +5219,41 @@ function broadcastUserLists() {
 
         sendJson(ws, {
             type: "user_list",
-            channelId: ws.activeChannelId || null,
+            channelId: uiChannelIdForClient(ws),
             clients: clientListFor(ws)
         });
     }
 }
 
 function activeTransmittersForClient(ws) {
-    const result = [];
+    const channelId =
+        ws?.rxChannelId || null;
 
-    for (const [channelId, state] of activeTransmitters) {
-        if (
-            !isClientOnChannel(ws, channelId) ||
-            state.userId === ws.userId
-        ) {
-            continue;
-        }
-
-        result.push({
-            channelId,
-            id: state.userId,
-            name: state.name || state.userId,
-            avatar: state.avatar || ""
-        });
+    if (!channelId) {
+        return [];
     }
 
-    return result;
+    const state =
+        activeTransmitters.get(channelId);
+
+    if (
+        !state ||
+        state.userId === ws.userId ||
+        !isClientOnChannel(ws, channelId)
+    ) {
+        return [];
+    }
+
+    return [{
+        channelId,
+        id: state.userId,
+        name: state.name || state.userId,
+        avatar: state.avatar || "",
+        elapsedMs:
+            state.startedAt > 0
+                ? Math.max(0, Date.now() - state.startedAt)
+                : 0
+    }];
 }
 
 function buildChannelStateMessage(ws) {
@@ -5201,6 +5262,7 @@ function buildChannelStateMessage(ws) {
         channels: Array.isArray(ws.channels) ? ws.channels : [],
         defaultChannelId: ws.defaultChannelId || null,
         activeChannelId: ws.activeChannelId || null,
+        rxChannelId: ws.rxChannelId || null,
         activeTransmitters: activeTransmittersForClient(ws)
     };
 }
@@ -5221,12 +5283,14 @@ function buildChannelStateMessage(ws) {
  */
 function sendCurrentTransmitterStart(
     ws,
-    channelId
+    channelId,
+    replayBootstrap = true
 ) {
     if (
         !isOpen(ws) ||
         !ws.userId ||
         !channelId ||
+        ws.rxChannelId !== channelId ||
         !isClientOnChannel(ws, channelId)
     ) {
         return false;
@@ -5260,6 +5324,10 @@ function sendCurrentTransmitterStart(
             avatar: active.avatar || "",
             channelId,
             channelName: channel?.name || "Canal",
+            elapsedMs:
+                active.startedAt > 0
+                    ? Math.max(0, Date.now() - active.startedAt)
+                    : 0,
 
             /*
              * O Android usa este marcador para saber que não é uma
@@ -5270,6 +5338,7 @@ function sendCurrentTransmitterStart(
     );
 
     const bootstrapPackets =
+        replayBootstrap &&
         Array.isArray(active.bootstrapPackets)
             ? active.bootstrapPackets
             : [];
@@ -5316,6 +5385,269 @@ function sendCurrentTransmitterStart(
 }
 
 // ============================================================
+// MULTICANAL RX / ARBITRAGEM
+// ============================================================
+
+function preferredTxChannelForClient(ws) {
+    if (!ws?.enabledChannelIds) {
+        return null;
+    }
+
+    if (
+        ws.defaultChannelId &&
+        ws.enabledChannelIds.has(ws.defaultChannelId)
+    ) {
+        return ws.defaultChannelId;
+    }
+
+    if (ws.enabledChannelIds.size === 1) {
+        return [...ws.enabledChannelIds][0] || null;
+    }
+
+    return null;
+}
+
+function receiveCandidatesForClient(ws) {
+    if (
+        !isOpen(ws) ||
+        !ws.userId ||
+        ws.txChannelId
+    ) {
+        return [];
+    }
+
+    const candidates = [];
+
+    for (const [channelId, state] of activeTransmitters) {
+        if (
+            state.userId === ws.userId ||
+            !isClientOnChannel(ws, channelId)
+        ) {
+            continue;
+        }
+
+        candidates.push({
+            channelId,
+            state
+        });
+    }
+
+    candidates.sort(
+        (a, b) =>
+            Number(a.state.startedAt || 0) -
+            Number(b.state.startedAt || 0)
+    );
+
+    return candidates;
+}
+
+function chooseReceiveChannelForClient(ws) {
+    const candidates =
+        receiveCandidatesForClient(ws);
+
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    const earliestStartedAt =
+        Number(candidates[0].state.startedAt || 0);
+
+    const simultaneous =
+        candidates.filter(item =>
+            Number(item.state.startedAt || 0) <=
+            earliestStartedAt + RX_SIMULTANEOUS_WINDOW_MS
+        );
+
+    const defaultCandidate =
+        simultaneous.find(item =>
+            item.channelId === ws.defaultChannelId
+        );
+
+    if (defaultCandidate) {
+        return defaultCandidate.channelId;
+    }
+
+    if (simultaneous.length === 1) {
+        return simultaneous[0].channelId;
+    }
+
+    /*
+     * O desempate aleatório nasce junto com cada TX. Assim dois aparelhos
+     * com a mesma seleção de canais chegam ao mesmo vencedor, em vez de
+     * cada cliente sortear um canal diferente.
+     */
+    let randomWinner =
+        simultaneous[0];
+
+    for (const item of simultaneous.slice(1)) {
+        if (
+            Number(item.state.randomPriority ?? 1) <
+            Number(randomWinner.state.randomPriority ?? 1)
+        ) {
+            randomWinner = item;
+        }
+    }
+
+    return randomWinner.channelId;
+}
+
+function clearReceiveSelectionTimer(ws) {
+    if (ws?.rxSelectionTimer) {
+        clearTimeout(ws.rxSelectionTimer);
+        ws.rxSelectionTimer = null;
+    }
+}
+
+function stopClientReceiveControl(
+    ws,
+    channelId
+) {
+    if (!channelId) {
+        return;
+    }
+
+    const state =
+        activeTransmitters.get(channelId);
+
+    sendJson(ws, {
+        type: "stop_tx",
+        from: state?.userId || "",
+        channelId
+    });
+}
+
+function ensureReceiveSelectionNow(
+    ws,
+    replayBootstrap = false
+) {
+    if (
+        !isOpen(ws) ||
+        !ws.userId ||
+        ws.txChannelId
+    ) {
+        return null;
+    }
+
+    clearReceiveSelectionTimer(ws);
+
+    if (ws.rxChannelId) {
+        const current =
+            activeTransmitters.get(ws.rxChannelId);
+
+        if (
+            current &&
+            current.userId !== ws.userId &&
+            isClientOnChannel(ws, ws.rxChannelId)
+        ) {
+            return ws.rxChannelId;
+        }
+
+        stopClientReceiveControl(
+            ws,
+            ws.rxChannelId
+        );
+
+        ws.rxChannelId = null;
+    }
+
+    const selected =
+        chooseReceiveChannelForClient(ws);
+
+    if (!selected) {
+        return null;
+    }
+
+    ws.rxChannelId =
+        selected;
+
+    sendCurrentTransmitterStart(
+        ws,
+        selected,
+        replayBootstrap
+    );
+
+    return selected;
+}
+
+function scheduleReceiveSelection(ws) {
+    if (
+        !isOpen(ws) ||
+        !ws.userId ||
+        ws.txChannelId ||
+        ws.rxChannelId ||
+        ws.rxSelectionTimer
+    ) {
+        return;
+    }
+
+    ws.rxSelectionTimer =
+        setTimeout(
+            () => {
+                ws.rxSelectionTimer = null;
+
+                ensureReceiveSelectionNow(
+                    ws,
+                    true
+                );
+            },
+            RX_SIMULTANEOUS_WINDOW_MS
+        );
+}
+
+function scheduleReceiveForAllEligibleClients() {
+    for (const client of clients.values()) {
+        scheduleReceiveSelection(client);
+    }
+}
+
+function stopSelectedChannelForClients(
+    channelId,
+    userId
+) {
+    for (const client of clients.values()) {
+        if (
+            !isOpen(client) ||
+            client.rxChannelId !== channelId
+        ) {
+            continue;
+        }
+
+        sendJson(client, {
+            type: "stop_tx",
+            from: userId,
+            channelId
+        });
+
+        client.rxChannelId = null;
+
+        /*
+         * As transmissões restantes já estão em andamento.
+         * Escolhemos imediatamente a mais antiga na fila; se houver
+         * empate dentro da janela, vale padrão -> aleatório.
+         */
+        ensureReceiveSelectionNow(
+            client,
+            false
+        );
+    }
+}
+
+function suspendReceiveForOwnTransmit(ws) {
+    clearReceiveSelectionTimer(ws);
+
+    if (!ws.rxChannelId) {
+        return;
+    }
+
+    stopClientReceiveControl(
+        ws,
+        ws.rxChannelId
+    );
+
+    ws.rxChannelId = null;
+}
+
+// ============================================================
 // AUDIO VALIDATION
 // ============================================================
 
@@ -5353,14 +5685,9 @@ function resetTransmitterIf(
             `[TX RESET] user=${userId} channel=${channelId}`
         );
 
-        broadcastJsonToChannel(
+        stopSelectedChannelForClients(
             channelId,
-            {
-                type: "stop_tx",
-                from: userId,
-                channelId
-            },
-            exceptId
+            userId
         );
     }
 
@@ -5646,10 +5973,28 @@ async function handleJson(
         ws.txChannelId =
             null;
 
+        ws.rxChannelId =
+            null;
+
+        clearReceiveSelectionTimer(ws);
+
         clients.set(
             userId,
             ws
         );
+
+        /*
+         * Ao entrar, o usuário já participa de todos os canais marcados.
+         * Se houver transmissões em andamento, seleciona uma conforme
+         * a ordem/prioridade antes de montar o init.
+         */
+        const initialRxChannel =
+            chooseReceiveChannelForClient(ws);
+
+        if (initialRxChannel) {
+            ws.rxChannelId =
+                initialRxChannel;
+        }
 
         /*
          * Atualiza atividade da sessão.
@@ -5706,6 +6051,9 @@ async function handleJson(
                 activeChannelId:
                     ws.activeChannelId || null,
 
+                rxChannelId:
+                    ws.rxChannelId || null,
+
                 activeTransmitters:
                     activeForClient,
 
@@ -5727,10 +6075,11 @@ async function handleJson(
          * no mesmo fluxo do servidor. Assim o cliente recebe o start_tx
          * de sincronização antes dos próximos pacotes live do transmissor.
          */
-        if (ws.activeChannelId) {
+        if (ws.rxChannelId) {
             sendCurrentTransmitterStart(
                 ws,
-                ws.activeChannelId
+                ws.rxChannelId,
+                true
             );
         }
 
@@ -5808,13 +6157,10 @@ async function handleJson(
             return;
         }
 
-        if (
-            ws.txChannelId &&
-            ws.txChannelId !== requestedChannelId
-        ) {
-            resetTransmitterIf(ws.userId);
-        }
-
+        /*
+         * Trocar a tela aberta não muda a escuta multicanal nem o canal
+         * de TX. O usuário continua presente em todos os canais marcados.
+         */
         ws.activeChannelId =
             requestedChannelId;
 
@@ -5832,12 +6178,12 @@ async function handleJson(
         );
 
         /*
-         * Se o canal selecionado já está ocupado, reproduz o start_tx
-         * somente para este cliente recém-chegado ao canal.
+         * RX não depende do canal aberto na interface. Se já existe uma
+         * transmissão escolhida pela arbitragem, ela continua normalmente.
          */
-        sendCurrentTransmitterStart(
+        ensureReceiveSelectionNow(
             ws,
-            requestedChannelId
+            false
         );
 
         broadcastUserLists();
@@ -5856,10 +6202,7 @@ async function handleJson(
             String(data.channelId || "").trim();
 
         const channelId =
-            requestedChannelId ||
-            ws.activeChannelId ||
-            ws.defaultChannelId ||
-            null;
+            preferredTxChannelForClient(ws);
 
         if (
             channelId &&
@@ -5885,35 +6228,34 @@ async function handleJson(
                 ws,
                 {
                     type: "tx_denied",
-                    code: "NO_ACTIVE_CHANNEL",
-                    message: "Selecione um canal ativo antes de transmitir."
+                    code: "NO_DEFAULT_CHANNEL",
+                    message: "Defina um canal padrão para transmitir."
                 }
             );
 
             return;
         }
 
-        // O pacote de controle e a tela aberta precisam apontar para
-        // o mesmo canal. Isso impede TX em um canal enquanto a interface
-        // está mostrando outro.
+        /*
+         * Segurança adicional: APK antigo que tentar transmitir em outro
+         * canal é recusado quando o servidor já conhece o padrão correto.
+         */
         if (
-            ws.activeChannelId &&
-            channelId !== ws.activeChannelId
+            requestedChannelId &&
+            requestedChannelId !== channelId
         ) {
             sendJson(
                 ws,
                 {
                     type: "tx_denied",
-                    code: "INVALID_CHANNEL",
-                    message: "O canal de transmissão não corresponde ao canal aberto."
+                    code: "DEFAULT_CHANNEL_ONLY",
+                    channelId,
+                    message: "A transmissão é feita somente no canal padrão."
                 }
             );
 
             return;
         }
-
-        ws.activeChannelId =
-            channelId;
 
         const active =
             activeTransmitters.get(channelId);
@@ -5942,6 +6284,13 @@ async function handleJson(
             return;
         }
 
+        /*
+         * PTT é half-duplex: ao começar a falar, este cliente deixa de
+         * ouvir temporariamente o canal escolhido pela arbitragem.
+         * Ao parar, volta automaticamente para a fila de RX.
+         */
+        suspendReceiveForOwnTransmit(ws);
+
         // Um mesmo usuário transmite em apenas um canal por vez.
         if (
             ws.txChannelId &&
@@ -5955,6 +6304,7 @@ async function handleJson(
             name: ws.name,
             avatar: ws.avatar || "",
             startedAt: Date.now(),
+            randomPriority: Math.random(),
             audioPacketCount: 0,
             audioBytesRelayed: 0,
 
@@ -5982,18 +6332,11 @@ async function handleJson(
             `[TX START] ${ws.userId} (${ws.name}) channel=${channelId}`
         );
 
-        broadcastJsonToChannel(
-            channelId,
-            {
-                type: "start_tx",
-                from: ws.userId,
-                name: ws.name,
-                avatar: ws.avatar || "",
-                channelId,
-                channelName: channel?.name || "Canal"
-            },
-            ws.userId
-        );
+        /*
+         * Não fazemos broadcast cego do start_tx. Cada ouvinte recebe
+         * somente o canal vencedor da arbitragem multicanal.
+         */
+        scheduleReceiveForAllEligibleClients();
 
         return;
     }
@@ -6007,7 +6350,7 @@ async function handleJson(
         "stop_tx"
     ) {
         const channelId =
-            ws.txChannelId || ws.activeChannelId || null;
+            ws.txChannelId || null;
 
         const state = channelId
             ? activeTransmitters.get(channelId)
@@ -6035,6 +6378,44 @@ async function handleJson(
             ws.userId,
             ws.userId
         );
+
+        /*
+         * Depois de falar, volta imediatamente a ouvir a transmissão
+         * mais antiga ainda ativa entre os canais marcados.
+         */
+        ensureReceiveSelectionNow(
+            ws,
+            false
+        );
+
+        return;
+    }
+
+    // ========================================================
+    // RESYNC RX MULTICANAL
+    // ========================================================
+
+    if (
+        data.type ===
+        "sync_rx"
+    ) {
+        if (
+            ws.rxChannelId &&
+            activeTransmitters.has(ws.rxChannelId)
+        ) {
+            sendCurrentTransmitterStart(
+                ws,
+                ws.rxChannelId,
+                true
+            );
+        } else {
+            ws.rxChannelId = null;
+
+            ensureReceiveSelectionNow(
+                ws,
+                true
+            );
+        }
 
         return;
     }
@@ -6104,6 +6485,12 @@ wss.on(
             null;
 
         ws.txChannelId =
+            null;
+
+        ws.rxChannelId =
+            null;
+
+        ws.rxSelectionTimer =
             null;
 
         ws.isAlive =
@@ -6182,6 +6569,8 @@ wss.on(
                     for (const client of clients.values()) {
                         if (
                             isClientOnChannel(client, channelId) &&
+                            client.rxChannelId === channelId &&
+                            !client.txChannelId &&
                             client.userId !== ws.userId
                         ) {
                             try {
@@ -6287,6 +6676,8 @@ wss.on(
                     `code=${code} ` +
                     `reason=${reason?.toString() || ""}`
                 );
+
+                clearReceiveSelectionTimer(ws);
 
                 if (
                     !ws.userId
