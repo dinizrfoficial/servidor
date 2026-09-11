@@ -5388,16 +5388,44 @@ function sendCurrentTransmitterStart(
 // MULTICANAL RX / ARBITRAGEM
 // ============================================================
 
-function preferredTxChannelForClient(ws) {
+function preferredTxChannelForClient(
+    ws,
+    requestedChannelId = null
+) {
     if (!ws?.enabledChannelIds) {
         return null;
     }
 
+    /*
+     * Regra de TX:
+     *
+     * 1. Se existe default válido, ele continua tendo prioridade.
+     *
+     * 2. Se NÃO existe default, o servidor aceita o canal explicitamente
+     *    solicitado pelo APK, desde que esteja marcado/habilitado.
+     *    Esse é o canal em que o usuário está dentro da PttActivity.
+     *
+     * 3. Sem default e sem canal explícito, um único canal marcado pode
+     *    ser usado automaticamente.
+     *
+     * 4. Com vários canais, sem default e sem canal explícito, não escolhe
+     *    um canal arbitrariamente.
+     */
     if (
         ws.defaultChannelId &&
         ws.enabledChannelIds.has(ws.defaultChannelId)
     ) {
         return ws.defaultChannelId;
+    }
+
+    const requested =
+        String(requestedChannelId || "").trim();
+
+    if (
+        requested &&
+        ws.enabledChannelIds.has(requested)
+    ) {
+        return requested;
     }
 
     if (ws.enabledChannelIds.size === 1) {
@@ -6202,7 +6230,10 @@ async function handleJson(
             String(data.channelId || "").trim();
 
         const channelId =
-            preferredTxChannelForClient(ws);
+            preferredTxChannelForClient(
+                ws,
+                requestedChannelId
+            );
 
         if (
             channelId &&
@@ -6228,8 +6259,8 @@ async function handleJson(
                 ws,
                 {
                     type: "tx_denied",
-                    code: "NO_DEFAULT_CHANNEL",
-                    message: "Defina um canal padrão para transmitir."
+                    code: "NO_TX_CHANNEL",
+                    message: "Entre em um canal ou defina um canal padrão para transmitir."
                 }
             );
 
@@ -6237,19 +6268,30 @@ async function handleJson(
         }
 
         /*
-         * Segurança adicional: APK antigo que tentar transmitir em outro
-         * canal é recusado quando o servidor já conhece o padrão correto.
+         * Segurança adicional:
+         * se existe default válido, APK antigo que pedir outro canal
+         * continua sendo recusado. Sem default, o canal atual solicitado
+         * é perfeitamente válido.
          */
+        const validDefaultChannelId =
+            (
+                ws.defaultChannelId &&
+                ws.enabledChannelIds?.has(ws.defaultChannelId)
+            )
+                ? ws.defaultChannelId
+                : null;
+
         if (
+            validDefaultChannelId &&
             requestedChannelId &&
-            requestedChannelId !== channelId
+            requestedChannelId !== validDefaultChannelId
         ) {
             sendJson(
                 ws,
                 {
                     type: "tx_denied",
                     code: "DEFAULT_CHANNEL_ONLY",
-                    channelId,
+                    channelId: validDefaultChannelId,
                     message: "A transmissão é feita somente no canal padrão."
                 }
             );
