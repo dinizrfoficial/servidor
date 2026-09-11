@@ -5177,7 +5177,10 @@ function activeTransmittersForClient(ws) {
     const result = [];
 
     for (const [channelId, state] of activeTransmitters) {
-        if (!isClientOnChannel(ws, channelId)) {
+        if (
+            !isClientOnChannel(ws, channelId) ||
+            state.userId === ws.userId
+        ) {
             continue;
         }
 
@@ -5333,7 +5336,8 @@ function isAudioPacket(
 // ============================================================
 
 function resetTransmitterIf(
-    userId
+    userId,
+    exceptId = null
 ) {
     const stopped = [];
 
@@ -5355,7 +5359,8 @@ function resetTransmitterIf(
                 type: "stop_tx",
                 from: userId,
                 channelId
-            }
+            },
+            exceptId
         );
     }
 
@@ -5986,7 +5991,8 @@ async function handleJson(
                 avatar: ws.avatar || "",
                 channelId,
                 channelName: channel?.name || "Canal"
-            }
+            },
+            ws.userId
         );
 
         return;
@@ -6026,6 +6032,7 @@ async function handleJson(
         }
 
         resetTransmitterIf(
+            ws.userId,
             ws.userId
         );
 
