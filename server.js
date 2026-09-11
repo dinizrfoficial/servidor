@@ -294,47 +294,118 @@ async function getUserProfile(uid) {
     return snapshot.exists() ? snapshot.val() || {} : {};
 }
 
-function getChannelAdminUids(channel) {
-    const admins =
-        channel && typeof channel.admins === "object" && channel.admins
+function getChannelModeratorUids(channel) {
+    /*
+     * moderators = estrutura nova.
+     * admins = estrutura antiga, lida apenas para compatibilidade/migração.
+     */
+    const moderators =
+        channel &&
+        typeof channel.moderators === "object" &&
+        channel.moderators
+            ? channel.moderators
+            : {};
+
+    const legacyAdmins =
+        channel &&
+        typeof channel.admins === "object" &&
+        channel.admins
             ? channel.admins
             : {};
 
-    return Object.keys(admins).filter(uid => String(uid || "").trim());
+    return [
+        ...new Set(
+            [
+                ...Object.keys(moderators),
+                ...Object.keys(legacyAdmins)
+            ]
+                .map(uid => String(uid || "").trim())
+                .filter(Boolean)
+        )
+    ];
+}
+
+function getChannelAdminUids(channel) {
+    /*
+     * Compatibilidade com clientes antigos.
+     * A partir desta versão estes UIDs representam MODERADORES.
+     */
+    return getChannelModeratorUids(channel);
 }
 
 function isChannelOwnerUser(channel, uid) {
     return String(channel?.ownerUid || "") === String(uid || "");
 }
 
-function isChannelDelegatedAdmin(channel, uid) {
+function isChannelModerator(channel, uid) {
     const normalizedUid = String(uid || "");
-    return (
-        !!normalizedUid &&
+
+    if (!normalizedUid) {
+        return false;
+    }
+
+    const inModerators =
+        !!channel?.moderators &&
+        Object.prototype.hasOwnProperty.call(
+            channel.moderators,
+            normalizedUid
+        );
+
+    const inLegacyAdmins =
         !!channel?.admins &&
-        Object.prototype.hasOwnProperty.call(channel.admins, normalizedUid)
-    );
+        Object.prototype.hasOwnProperty.call(
+            channel.admins,
+            normalizedUid
+        );
+
+    return inModerators || inLegacyAdmins;
+}
+
+function isChannelDelegatedAdmin(channel, uid) {
+    /*
+     * Alias temporário para trechos antigos do servidor.
+     * Semântica nova: antigo administrador delegado = Moderador.
+     */
+    return isChannelModerator(channel, uid);
 }
 
 function canModerateChannel(channel, uid) {
     return (
         isChannelOwnerUser(channel, uid) ||
-        isChannelDelegatedAdmin(channel, uid)
+        isChannelModerator(channel, uid)
     );
 }
 
-function updateInMemoryChannelAdmins(channelId, channel) {
-    const adminUids = getChannelAdminUids(channel);
+function updateInMemoryChannelModerators(channelId, channel) {
+    const moderatorUids =
+        getChannelModeratorUids(channel);
 
     for (const ws of clients.values()) {
         const item = Array.isArray(ws.channels)
-            ? ws.channels.find(entry => String(entry.id) === String(channelId))
+            ? ws.channels.find(
+                entry =>
+                    String(entry.id) === String(channelId)
+            )
             : null;
 
         if (item) {
-            item.adminUids = adminUids;
+            item.moderatorUids =
+                moderatorUids;
+
+            /*
+             * Compatibilidade com Android antigo.
+             */
+            item.adminUids =
+                moderatorUids;
         }
     }
+}
+
+function updateInMemoryChannelAdmins(channelId, channel) {
+    updateInMemoryChannelModerators(
+        channelId,
+        channel
+    );
 }
 
 async function getUserChannels(uid) {
@@ -371,7 +442,11 @@ async function getUserChannels(uid) {
             description: channel.description || "",
             type: channel.type || "public",
             ownerUid: channel.ownerUid || "",
-            adminUids: getChannelAdminUids(channel),
+            moderatorUids: getChannelModeratorUids(channel),
+
+            // Compatibilidade com versões antigas do Android.
+            adminUids: getChannelModeratorUids(channel),
+
             avatar: sanitizeAvatar(channel.avatar),
             blocked,
             enabled: !blocked && membership?.enabled !== false,
@@ -1443,14 +1518,15 @@ async function handleRemoveChannel(req, res) {
             resetTransmitterIf(decoded.uid);
         }
 
-        const wasDelegatedAdmin =
-            isChannelDelegatedAdmin(channel, decoded.uid);
+        const wasModerator =
+            isChannelModerator(channel, decoded.uid);
 
         const updates = {
             [`users/${decoded.uid}/channels/${channelId}`]: null
         };
 
-        if (wasDelegatedAdmin) {
+        if (wasModerator) {
+            updates[`channels/${channelId}/moderators/${decoded.uid}`] = null;
             updates[`channels/${channelId}/admins/${decoded.uid}`] = null;
         }
 
@@ -1460,7 +1536,7 @@ async function handleRemoveChannel(req, res) {
 
         await db.ref().update(updates);
 
-        if (wasDelegatedAdmin) {
+        if (wasModerator) {
             const refreshedChannelSnapshot = await db
                 .ref(`channels/${channelId}`)
                 .get();
@@ -1528,7 +1604,7 @@ async function getOwnedChannelOrRespond(res, ownerUid, channelId) {
     if (String(channel.ownerUid || "") !== ownerUid) {
         sendHttpJson(res, 403, {
             success: false,
-            error: "Somente o administrador do canal pode executar esta ação"
+            error: "Somente o Administrador do canal pode executar esta ação"
         });
         return null;
     }
@@ -1562,7 +1638,7 @@ async function getManagedChannelOrRespond(res, actorUid, channelId) {
     if (!canModerateChannel(channel, actorUid)) {
         sendHttpJson(res, 403, {
             success: false,
-            error: "Você não tem permissão para administrar usuários deste canal"
+            error: "Você não tem permissão para moderar usuários deste canal"
         });
         return null;
     }
@@ -1666,7 +1742,7 @@ async function handleDisconnectChannelUser(req, res) {
             sendJson(targetWs, {
                 type: "channel_disconnected",
                 channelId,
-                message: "Você foi desconectado deste canal pelo administrador."
+                message: "Você foi desconectado deste canal pelo Administrador."
             });
         }
 
@@ -1753,7 +1829,7 @@ async function handleBlockChannelUser(req, res) {
 
         const actorIsOwner = isChannelOwnerUser(channel, decoded.uid);
         const targetIsOwner = isChannelOwnerUser(channel, targetUid);
-        const targetIsAdmin = isChannelDelegatedAdmin(channel, targetUid);
+        const targetIsModerator = isChannelModerator(channel, targetUid);
 
         if (targetIsOwner) {
             sendHttpJson(res, 403, {
@@ -1763,10 +1839,10 @@ async function handleBlockChannelUser(req, res) {
             return;
         }
 
-        if (!actorIsOwner && targetIsAdmin) {
+        if (!actorIsOwner && targetIsModerator) {
             sendHttpJson(res, 403, {
                 success: false,
-                error: "Um administrador não pode bloquear outro administrador"
+                error: "Um Moderador não pode bloquear outro Moderador"
             });
             return;
         }
@@ -1794,7 +1870,10 @@ async function handleBlockChannelUser(req, res) {
             blockedBy: decoded.uid
         };
 
-        if (actorIsOwner && targetIsAdmin) {
+        if (actorIsOwner && targetIsModerator) {
+            updates[`channels/${channelId}/moderators/${targetUid}`] = null;
+
+            // Remove também eventual função antiga.
             updates[`channels/${channelId}/admins/${targetUid}`] = null;
         }
 
@@ -1809,7 +1888,7 @@ async function handleBlockChannelUser(req, res) {
 
         await db.ref().update(updates);
 
-        if (actorIsOwner && targetIsAdmin) {
+        if (actorIsOwner && targetIsModerator) {
             const refreshedChannelSnapshot = await db
                 .ref(`channels/${channelId}`)
                 .get();
@@ -1832,7 +1911,7 @@ async function handleBlockChannelUser(req, res) {
             sendJson(targetWs, {
                 type: "channel_blocked",
                 channelId,
-                message: "Você foi bloqueado neste canal pelo administrador."
+                message: "Você foi bloqueado neste canal pela Moderação."
             });
         }
 
@@ -1939,7 +2018,7 @@ async function handleUnblockChannelUser(req, res) {
     }
 }
 
-async function handleMakeChannelAdmin(req, res) {
+async function handleMakeChannelModerator(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
             success: false,
@@ -1992,7 +2071,7 @@ async function handleMakeChannelAdmin(req, res) {
         if (targetUid === decoded.uid) {
             sendHttpJson(res, 400, {
                 success: false,
-                error: "Você já é o administrador principal deste canal"
+                error: "Você já é o Administrador deste canal"
             });
             return;
         }
@@ -2006,7 +2085,7 @@ async function handleMakeChannelAdmin(req, res) {
         ) {
             sendHttpJson(res, 409, {
                 success: false,
-                error: "Desbloqueie este usuário antes de torná-lo administrador"
+                error: "Desbloqueie este usuário antes de torná-lo Moderador"
             });
             return;
         }
@@ -2026,7 +2105,7 @@ async function handleMakeChannelAdmin(req, res) {
         const now = Date.now();
 
         await db.ref().update({
-            [`channels/${channelId}/admins/${targetUid}`]: {
+            [`channels/${channelId}/moderators/${targetUid}`]: {
                 addedAt: now,
                 addedBy: decoded.uid,
                 permissions: {
@@ -2034,6 +2113,12 @@ async function handleMakeChannelAdmin(req, res) {
                     unblockUsers: true
                 }
             },
+
+            /*
+             * Limpa eventual registro da nomenclatura antiga.
+             */
+            [`channels/${channelId}/admins/${targetUid}`]: null,
+
             [`channels/${channelId}/updatedAt`]: now
         });
 
@@ -2052,7 +2137,7 @@ async function handleMakeChannelAdmin(req, res) {
         broadcastUserLists();
 
         console.log(
-            `[CHANNEL MAKE ADMIN] owner=${decoded.uid} ` +
+            `[CHANNEL MAKE MODERATOR] owner=${decoded.uid} ` +
             `target=${targetUid} channel=${channelId}`
         );
 
@@ -2063,15 +2148,15 @@ async function handleMakeChannelAdmin(req, res) {
         });
 
     } catch (error) {
-        console.error("[CHANNEL MAKE ADMIN]", error.message);
+        console.error("[CHANNEL MAKE MODERATOR]", error.message);
         sendHttpJson(res, 500, {
             success: false,
-            error: "Não foi possível tornar o usuário administrador"
+            error: "Não foi possível tornar o usuário Moderador"
         });
     }
 }
 
-async function handleRemoveChannelAdmin(req, res) {
+async function handleRemoveChannelModerator(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
             success: false,
@@ -2114,8 +2199,8 @@ async function handleRemoveChannelAdmin(req, res) {
     }
 
     try {
-        // Somente o criador/administrador principal pode revogar
-        // a função administrativa de um administrador delegado.
+        // Somente o Administrador/criador pode remover a função
+        // de Moderação de outro usuário.
         const channel = await getOwnedChannelOrRespond(
             res,
             decoded.uid,
@@ -2126,15 +2211,15 @@ async function handleRemoveChannelAdmin(req, res) {
         if (targetUid === decoded.uid || isChannelOwnerUser(channel, targetUid)) {
             sendHttpJson(res, 400, {
                 success: false,
-                error: "O administrador principal não pode ter sua função removida"
+                error: "O Administrador do canal não pode ter sua função removida"
             });
             return;
         }
 
-        if (!isChannelDelegatedAdmin(channel, targetUid)) {
+        if (!isChannelModerator(channel, targetUid)) {
             sendHttpJson(res, 409, {
                 success: false,
-                error: "Este usuário não é administrador deste canal"
+                error: "Este usuário não é Moderador deste canal"
             });
             return;
         }
@@ -2142,7 +2227,11 @@ async function handleRemoveChannelAdmin(req, res) {
         const now = Date.now();
 
         await db.ref().update({
+            [`channels/${channelId}/moderators/${targetUid}`]: null,
+
+            // Remove também eventual registro legado.
             [`channels/${channelId}/admins/${targetUid}`]: null,
+
             [`channels/${channelId}/updatedAt`]: now
         });
 
@@ -2163,7 +2252,7 @@ async function handleRemoveChannelAdmin(req, res) {
         broadcastUserLists();
 
         console.log(
-            `[CHANNEL REMOVE ADMIN] owner=${decoded.uid} ` +
+            `[CHANNEL REMOVE MODERATOR] owner=${decoded.uid} ` +
             `target=${targetUid} channel=${channelId}`
         );
 
@@ -2174,10 +2263,10 @@ async function handleRemoveChannelAdmin(req, res) {
         });
 
     } catch (error) {
-        console.error("[CHANNEL REMOVE ADMIN]", error.message);
+        console.error("[CHANNEL REMOVE MODERATOR]", error.message);
         sendHttpJson(res, 500, {
             success: false,
-            error: "Não foi possível remover a função de administrador"
+            error: "Não foi possível remover a Moderação"
         });
     }
 }
@@ -4789,17 +4878,23 @@ const httpServer =
 
             if (
                 req.method === "POST" &&
-                req.url === "/api/channels/make-admin"
+                (
+                    req.url === "/api/channels/make-moderator" ||
+                    req.url === "/api/channels/make-admin"
+                )
             ) {
-                await handleMakeChannelAdmin(req, res);
+                await handleMakeChannelModerator(req, res);
                 return;
             }
 
             if (
                 req.method === "POST" &&
-                req.url === "/api/channels/remove-admin"
+                (
+                    req.url === "/api/channels/remove-moderator" ||
+                    req.url === "/api/channels/remove-admin"
+                )
             ) {
-                await handleRemoveChannelAdmin(req, res);
+                await handleRemoveChannelModerator(req, res);
                 return;
             }
 
@@ -4917,29 +5012,82 @@ function clientListFor(ws) {
         ? ws.channels.find(item => String(item.id) === String(channelId))
         : null;
 
-    const ownerUid = String(channel?.ownerUid || "");
-    const adminUids = new Set(
-        Array.isArray(channel?.adminUids)
-            ? channel.adminUids.map(value => String(value))
-            : []
-    );
+    const ownerUid =
+        String(
+            channel?.ownerUid || ""
+        );
+
+    const moderatorUids =
+        new Set(
+            Array.isArray(channel?.moderatorUids)
+                ? channel.moderatorUids.map(
+                    value => String(value)
+                )
+                : (
+                    Array.isArray(channel?.adminUids)
+                        ? channel.adminUids.map(
+                            value => String(value)
+                        )
+                        : []
+                )
+        );
 
     return [
         ...clients.values()
     ]
-        .filter(client => isClientOnChannel(client, channelId))
+        .filter(
+            client =>
+                isClientOnChannel(
+                    client,
+                    channelId
+                )
+        )
         .map(client => {
-            const clientUid = String(client.userId || "");
-            const isOwner = !!clientUid && clientUid === ownerUid;
-            const isAdmin = isOwner || adminUids.has(clientUid);
+            const clientUid =
+                String(
+                    client.userId || ""
+                );
+
+            const isOwner =
+                !!clientUid &&
+                clientUid === ownerUid;
+
+            const isModerator =
+                !isOwner &&
+                moderatorUids.has(
+                    clientUid
+                );
 
             return {
-                id: client.userId,
-                name: client.name,
-                avatar: client.avatar || "",
+                id:
+                    client.userId,
+
+                name:
+                    client.name,
+
+                avatar:
+                    client.avatar || "",
+
                 isOwner,
-                isAdmin,
-                role: isOwner ? "owner" : (isAdmin ? "admin" : "user")
+
+                isModerator,
+
+                /*
+                 * Compatibilidade com Android antigo.
+                 * Na versão nova, Moderador é lido por isModerator.
+                 */
+                isAdmin:
+                    isOwner ||
+                    isModerator,
+
+                role:
+                    isOwner
+                        ? "owner"
+                        : (
+                            isModerator
+                                ? "moderator"
+                                : "user"
+                        )
             };
         });
 }
