@@ -223,8 +223,10 @@ const LATE_JOIN_BOOTSTRAP_PACKETS =
  * Dentro dela, o canal padrão do usuário tem prioridade; se o padrão
  * não estiver entre os candidatos, o vencedor é escolhido aleatoriamente.
  */
-const RX_SIMULTANEOUS_WINDOW_MS =
-    60;
+const RX_SIMULTANEOUS_WINDOW_MS = 60;
+
+const TX_PREEMPT_NORMAL_MS = 60_000;
+const TX_PREEMPT_PRIVILEGED_MS = 5_000;
 
 // ============================================================
 // CANAIS
@@ -546,23 +548,21 @@ async function refreshConnectedClientChannels(uid) {
         }
 
         /*
-         * TX é sempre no canal padrão quando há vários canais ativos.
-         * Se existir somente um canal ativo, ele pode ser usado mesmo
-         * sem default explícito.
+         * O canal atual pode ter prioridade sobre o padrão.
+         * Só encerra o TX se o canal realmente deixou de estar habilitado.
          */
-        const allowedTxChannel =
-            preferredTxChannelForClient(ws);
-
         if (
             previousTxChannelId &&
-            previousTxChannelId !== allowedTxChannel
+            !ws.enabledChannelIds.has(
+                previousTxChannelId
+            )
         ) {
             resetTransmitterIf(uid);
 
             sendJson(ws, {
                 type: "tx_denied",
                 code: "CHANNEL_CHANGED",
-                message: "O canal padrão de transmissão foi alterado."
+                message: "O canal de transmissão deixou de estar ativo."
             });
         }
 
@@ -5420,28 +5420,6 @@ function preferredTxChannelForClient(
         return null;
     }
 
-    /*
-     * Regra de TX:
-     *
-     * 1. Se existe default válido, ele continua tendo prioridade.
-     *
-     * 2. Se NÃO existe default, o servidor aceita o canal explicitamente
-     *    solicitado pelo APK, desde que esteja marcado/habilitado.
-     *    Esse é o canal em que o usuário está dentro da PttActivity.
-     *
-     * 3. Sem default e sem canal explícito, um único canal marcado pode
-     *    ser usado automaticamente.
-     *
-     * 4. Com vários canais, sem default e sem canal explícito, não escolhe
-     *    um canal arbitrariamente.
-     */
-    if (
-        ws.defaultChannelId &&
-        ws.enabledChannelIds.has(ws.defaultChannelId)
-    ) {
-        return ws.defaultChannelId;
-    }
-
     const requested =
         String(requestedChannelId || "").trim();
 
@@ -5452,11 +5430,89 @@ function preferredTxChannelForClient(
         return requested;
     }
 
+    if (
+        ws.defaultChannelId &&
+        ws.enabledChannelIds.has(ws.defaultChannelId)
+    ) {
+        return ws.defaultChannelId;
+    }
+
     if (ws.enabledChannelIds.size === 1) {
         return [...ws.enabledChannelIds][0] || null;
     }
 
     return null;
+}
+
+function txChannelMetadataForClient(
+    ws,
+    channelId
+) {
+    return Array.isArray(ws?.channels)
+        ? ws.channels.find(
+            item =>
+                String(item?.id || "") ===
+                String(channelId || "")
+        )
+        : null;
+}
+
+function txPreemptThresholdMs(
+    ws,
+    channelId
+) {
+    const channel =
+        txChannelMetadataForClient(
+            ws,
+            channelId
+        );
+
+    const uid =
+        String(
+            ws?.userId || ""
+        );
+
+    if (
+        !channel ||
+        !uid
+    ) {
+        return TX_PREEMPT_NORMAL_MS;
+    }
+
+    const isOwner =
+        String(
+            channel.ownerUid || ""
+        ) === uid;
+
+    const moderators =
+        new Set(
+            (
+                Array.isArray(channel.moderatorUids)
+                    ? channel.moderatorUids
+                    : (
+                        Array.isArray(channel.adminUids)
+                            ? channel.adminUids
+                            : []
+                    )
+            )
+                .map(
+                    value =>
+                        String(value || "")
+                )
+                .filter(Boolean)
+        );
+
+    const isModerator =
+        moderators.has(
+            uid
+        );
+
+    return (
+        isOwner ||
+        isModerator
+    )
+        ? TX_PREEMPT_PRIVILEGED_MS
+        : TX_PREEMPT_NORMAL_MS;
 }
 
 function receiveCandidatesForClient(ws) {
@@ -5654,7 +5710,8 @@ function scheduleReceiveForAllEligibleClients() {
 
 function stopSelectedChannelForClients(
     channelId,
-    userId
+    userId,
+    reselectImmediately = true
 ) {
     for (const client of clients.values()) {
         if (
@@ -5672,16 +5729,100 @@ function stopSelectedChannelForClients(
 
         client.rxChannelId = null;
 
-        /*
-         * As transmissões restantes já estão em andamento.
-         * Escolhemos imediatamente a mais antiga na fila; se houver
-         * empate dentro da janela, vale padrão -> aleatório.
-         */
-        ensureReceiveSelectionNow(
-            client,
-            false
+        if (reselectImmediately) {
+            /*
+             * As transmissões restantes já estão em andamento.
+             * Escolhemos imediatamente a mais antiga na fila; se houver
+             * empate dentro da janela, vale padrão -> aleatório.
+             */
+            ensureReceiveSelectionNow(
+                client,
+                false
+            );
+        }
+    }
+}
+
+function preemptActiveTransmitter(
+    channelId,
+    activeState,
+    requesterWs
+) {
+    if (
+        !channelId ||
+        !activeState ||
+        !activeState.userId
+    ) {
+        return false;
+    }
+
+    const interruptedUserId =
+        String(
+            activeState.userId
+        );
+
+    const interruptedWs =
+        clients.get(
+            interruptedUserId
+        );
+
+    console.log(
+        `[TX PREEMPT] channel=${channelId} ` +
+        `old=${interruptedUserId} ` +
+        `new=${requesterWs?.userId || "?"}`
+    );
+
+    if (
+        interruptedWs &&
+        isOpen(interruptedWs)
+    ) {
+        sendJson(
+            interruptedWs,
+            {
+                type: "tx_denied",
+                code: "TX_PREEMPTED",
+                channelId,
+                name:
+                    requesterWs?.name ||
+                    requesterWs?.userId ||
+                    "",
+                message:
+                    `Sua transmissão foi interrompida por ` +
+                    `${requesterWs?.name || "outro usuário"}.`
+            }
+        );
+
+        if (
+            interruptedWs.txChannelId ===
+            channelId
+        ) {
+            interruptedWs.txChannelId =
+                null;
+        }
+    }
+
+    const current =
+        activeTransmitters.get(
+            channelId
+        );
+
+    if (
+        current &&
+        current.userId ===
+            interruptedUserId
+    ) {
+        activeTransmitters.delete(
+            channelId
         );
     }
+
+    stopSelectedChannelForClients(
+        channelId,
+        interruptedUserId,
+        false
+    );
+
+    return true;
 }
 
 function suspendReceiveForOwnTransmit(ws) {
@@ -6292,36 +6433,8 @@ async function handleJson(
         }
 
         /*
-         * Segurança adicional:
-         * se existe default válido, APK antigo que pedir outro canal
-         * continua sendo recusado. Sem default, o canal atual solicitado
-         * é perfeitamente válido.
+         * O canal atualmente aberto pode superar o canal padrão.
          */
-        const validDefaultChannelId =
-            (
-                ws.defaultChannelId &&
-                ws.enabledChannelIds?.has(ws.defaultChannelId)
-            )
-                ? ws.defaultChannelId
-                : null;
-
-        if (
-            validDefaultChannelId &&
-            requestedChannelId &&
-            requestedChannelId !== validDefaultChannelId
-        ) {
-            sendJson(
-                ws,
-                {
-                    type: "tx_denied",
-                    code: "DEFAULT_CHANNEL_ONLY",
-                    channelId: validDefaultChannelId,
-                    message: "A transmissão é feita somente no canal padrão."
-                }
-            );
-
-            return;
-        }
 
         const active =
             activeTransmitters.get(channelId);
@@ -6330,24 +6443,76 @@ async function handleJson(
             active &&
             active.userId !== ws.userId
         ) {
-            console.log(
-                `[TX DENIED] ${ws.userId} tentou transmitir ` +
-                `channel=${channelId}; ocupado por ${active.userId}`
-            );
+            const now =
+                Date.now();
 
-            sendJson(
-                ws,
-                {
-                    type: "tx_denied",
-                    code: "CHANNEL_BUSY",
-                    channelId,
-                    name: active.name || active.userId,
-                    avatar: active.avatar || "",
-                    message: "Canal ocupado"
-                }
-            );
+            const elapsedMs =
+                Math.max(
+                    0,
+                    now -
+                        Number(
+                            active.startedAt || now
+                        )
+                );
 
-            return;
+            const interruptAfterMs =
+                txPreemptThresholdMs(
+                    ws,
+                    channelId
+                );
+
+            if (
+                elapsedMs <
+                interruptAfterMs
+            ) {
+                const remainingMs =
+                    interruptAfterMs -
+                    elapsedMs;
+
+                const remainingSeconds =
+                    Math.max(
+                        1,
+                        Math.ceil(
+                            remainingMs /
+                                1000
+                        )
+                    );
+
+                console.log(
+                    `[TX DENIED] ${ws.userId} tentou transmitir ` +
+                    `channel=${channelId}; ocupado por ${active.userId}; ` +
+                    `interrupção em ${remainingSeconds}s`
+                );
+
+                sendJson(
+                    ws,
+                    {
+                        type: "tx_denied",
+                        code: "CHANNEL_BUSY",
+                        channelId,
+                        name:
+                            active.name ||
+                            active.userId,
+                        avatar:
+                            active.avatar ||
+                            "",
+                        elapsedMs,
+                        interruptAfterMs,
+                        remainingMs,
+                        message:
+                            `Canal ocupado - interrupção em ` +
+                            `${remainingSeconds}s`
+                    }
+                );
+
+                return;
+            }
+
+            preemptActiveTransmitter(
+                channelId,
+                active,
+                ws
+            );
         }
 
         /*
