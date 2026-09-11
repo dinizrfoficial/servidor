@@ -2555,7 +2555,14 @@ async function handleSetDefaultChannel(req, res) {
 
     const channelId = String(body.channelId || "").trim();
 
-    if (!isValidChannelId(channelId)) {
+    /*
+     * channelId vazio significa remover o canal padrão.
+     * O mesmo endpoint continua servindo para definir e remover.
+     */
+    if (
+        channelId &&
+        !isValidChannelId(channelId)
+    ) {
         sendHttpJson(res, 400, {
             success: false,
             error: "ID de canal inválido"
@@ -2564,6 +2571,23 @@ async function handleSetDefaultChannel(req, res) {
     }
 
     try {
+        if (!channelId) {
+            await db
+                .ref(`users/${decoded.uid}/defaultChannelId`)
+                .set(null);
+
+            await refreshConnectedClientChannels(
+                decoded.uid
+            );
+
+            sendHttpJson(res, 200, {
+                success: true,
+                defaultChannelId: null
+            });
+
+            return;
+        }
+
         const channelSnapshot = await db
             .ref(`channels/${channelId}`)
             .get();
