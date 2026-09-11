@@ -1060,49 +1060,131 @@ async function handleSetUserAvatar(req, res) {
         return;
     }
 
+    /*
+     * Primeiro persiste no Firebase.
+     *
+     * Somente falha de persistência deve devolver erro ao aplicativo.
+     * A sincronização em tempo real via WebSocket é secundária e não
+     * pode transformar uma gravação já concluída em resposta HTTP 500.
+     */
     try {
         await db
             .ref(`users/${decoded.uid}/avatar`)
             .set(avatar || null);
-
-        const ws = clients.get(decoded.uid);
-        if (ws && isOpen(ws)) {
-            ws.avatar = avatar;
-
-            for (const state of activeTransmitters.values()) {
-                if (state.userId === decoded.uid) {
-                    state.avatar = avatar;
-                }
-            }
-
-            // Atualiza imediatamente todos que compartilham algum canal com este usuário.
-            for (const peer of clients.values()) {
-                if (!isOpen(peer) || !shareAnyEnabledChannel(peer, ws)) {
-                    continue;
-                }
-
-                sendJson(peer, {
-                    type: "user_update",
-                    id: decoded.uid,
-                    name: ws.name || "Anônimo",
-                    avatar
-                });
-            }
-        }
-
-        broadcastUserLists();
-
-        sendHttpJson(res, 200, {
-            success: true,
-            avatar
-        });
     } catch (error) {
-        console.error("[USER AVATAR]", error.message);
+        console.error(
+            "[USER AVATAR][DB]",
+            error.message
+        );
+
         sendHttpJson(res, 500, {
             success: false,
             error: "Não foi possível alterar a imagem do perfil"
         });
+
+        return;
     }
+
+    /*
+     * Sincroniza o avatar nos clientes conectados.
+     * Qualquer problema aqui é registrado, mas a operação continua
+     * sendo considerada sucesso porque o Firebase já foi atualizado.
+     */
+    try {
+        const ws =
+            clients.get(
+                decoded.uid
+            );
+
+        if (
+            ws &&
+            isOpen(ws)
+        ) {
+            ws.avatar =
+                avatar;
+
+            for (
+            const state of
+                activeTransmitters.values()
+            ) {
+                if (
+                    state.userId ===
+                    decoded.uid
+                ) {
+                    state.avatar =
+                        avatar;
+                }
+            }
+
+            /*
+             * Atualiza o próprio cliente SEM depender de canal em comum.
+             * Isso garante refresh imediato mesmo se o usuário estiver
+             * momentaneamente sem nenhum canal marcado.
+             */
+            sendJson(
+                ws,
+                {
+                    type: "user_update",
+                    id: decoded.uid,
+                    name:
+                        ws.name ||
+                        "Anônimo",
+                    avatar
+                }
+            );
+
+            /*
+             * Atualiza os demais clientes que compartilham pelo menos
+             * um canal marcado com o usuário.
+             */
+            for (
+            const peer of
+                clients.values()
+            ) {
+                if (
+                    peer === ws ||
+                    !isOpen(peer) ||
+                    !shareAnyEnabledChannel(
+                        peer,
+                        ws
+                    )
+                ) {
+                    continue;
+                }
+
+                sendJson(
+                    peer,
+                    {
+                        type: "user_update",
+                        id: decoded.uid,
+                        name:
+                            ws.name ||
+                            "Anônimo",
+                        avatar
+                    }
+                );
+            }
+        }
+    } catch (error) {
+        console.error(
+            "[USER AVATAR][WS SYNC]",
+            error.message
+        );
+    }
+
+    try {
+        broadcastUserLists();
+    } catch (error) {
+        console.error(
+            "[USER AVATAR][USER LIST]",
+            error.message
+        );
+    }
+
+    sendHttpJson(res, 200, {
+        success: true,
+        avatar
+    });
 }
 
 async function handleSetChannelAvatar(req, res) {
@@ -5062,6 +5144,53 @@ function isClientOnChannel(client, channelId) {
         !!channelId &&
         client.enabledChannelIds?.has(channelId)
     );
+}
+
+/*
+ * Retorna true quando dois clientes compartilham pelo menos
+ * um canal marcado/habilitado.
+ *
+ * Esta função já era chamada pelo fluxo de atualização de avatar,
+ * mas não existia no server.js. Isso gerava ReferenceError DEPOIS
+ * de o avatar já ter sido salvo no Firebase, fazendo o servidor
+ * responder 500 mesmo com a alteração persistida.
+ */
+function shareAnyEnabledChannel(
+    clientA,
+    clientB
+) {
+    const channelsA =
+        clientA?.enabledChannelIds;
+
+    const channelsB =
+        clientB?.enabledChannelIds;
+
+    if (
+        !channelsA ||
+        !channelsB ||
+        channelsA.size === 0 ||
+        channelsB.size === 0
+    ) {
+        return false;
+    }
+
+    const smallest =
+        channelsA.size <= channelsB.size
+            ? channelsA
+            : channelsB;
+
+    const largest =
+        smallest === channelsA
+            ? channelsB
+            : channelsA;
+
+    for (const channelId of smallest) {
+        if (largest.has(channelId)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function uiChannelIdForClient(ws) {
