@@ -6040,6 +6040,18 @@ function chooseReceiveChannelForClient(ws) {
         return null;
     }
 
+    /*
+     * A advertência do Modo Assistente é áudio PTT do próprio canal e tem
+     * prioridade de recepção sobre outras falas multicanal. Isso garante que
+     * quem está conectado ao canal realmente ouça o aviso automático.
+     */
+    const assistantCandidate =
+        candidates.find(item => item.state?.assistantGenerated);
+
+    if (assistantCandidate) {
+        return assistantCandidate.channelId;
+    }
+
     const earliestStartedAt =
         Number(candidates[0].state.startedAt || 0);
 
@@ -6191,6 +6203,40 @@ function scheduleReceiveSelection(ws) {
 function scheduleReceiveForAllEligibleClients() {
     for (const client of clients.values()) {
         scheduleReceiveSelection(client);
+    }
+}
+
+function forceAssistantWarningReceive(
+    channelId,
+    transmitterUserId
+) {
+    for (const client of clients.values()) {
+        if (
+            !isOpen(client) ||
+            client.userId === transmitterUserId ||
+            client.txChannelId ||
+            !canClientReceiveFromChannel(client, channelId)
+        ) {
+            continue;
+        }
+
+        clearReceiveSelectionTimer(client);
+
+        /*
+         * Não enviamos stop_tx artificial do canal que estava sendo ouvido,
+         * porque isso faria o Android tocar Roger Bip sem o TX remoto ter
+         * realmente terminado. Apenas trocamos a seleção de RX e enviamos o
+         * start_tx da advertência; como sendCurrentTransmitterStart marca
+         * lateJoin=true, o cliente reinicia o pipeline de áudio de forma limpa.
+         */
+        client.rxChannelId =
+            channelId;
+
+        sendCurrentTransmitterStart(
+            client,
+            channelId,
+            false
+        );
     }
 }
 
@@ -6414,6 +6460,15 @@ const ASSISTANT_WARNING_CODES = new Set([
 const assistantWarningCooldowns = new Map();
 
 function notifyAssistantOwnerTxStart(channelId, state) {
+    /*
+     * Uma advertência gerada pelo próprio Assistente é um TX técnico.
+     * Ela não pode entrar novamente nas regras de monitoramento, senão
+     * poderia criar advertências recursivas.
+     */
+    if (state?.assistantGenerated) {
+        return;
+    }
+
     const ownerUid = String(state?.channelOwnerUid || "");
 
     if (!ownerUid) {
@@ -6440,6 +6495,10 @@ function notifyAssistantOwnerTxStart(channelId, state) {
 }
 
 function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
+    if (state?.assistantGenerated) {
+        return;
+    }
+
     const ownerUid = String(state?.channelOwnerUid || "");
 
     if (!ownerUid) {
@@ -6468,19 +6527,6 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
         durationMs: Math.max(0, endedAt - startedAt),
         reason
     });
-}
-
-function broadcastAssistantWarning(channelId, data) {
-    for (const client of clients.values()) {
-        if (
-            !isOpen(client) ||
-            !canClientReceiveFromChannel(client, channelId)
-        ) {
-            continue;
-        }
-
-        sendJson(client, data);
-    }
 }
 
 // ============================================================
@@ -7053,6 +7099,41 @@ async function handleJson(
 
         if (
             active &&
+            active.userId === ws.userId &&
+            active.assistantGenerated
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "ASSISTANT_WARNING_ACTIVE",
+                    channelId,
+                    message: "Aguarde o término da advertência automática."
+                }
+            );
+            return;
+        }
+
+        if (
+            active &&
+            active.userId !== ws.userId &&
+            active.assistantGenerated
+        ) {
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "ASSISTANT_WARNING_ACTIVE",
+                    channelId,
+                    name: "Assistente",
+                    message: "Aguarde o término da advertência automática."
+                }
+            );
+            return;
+        }
+
+        if (
+            active &&
             active.userId !== ws.userId
         ) {
             const now =
@@ -7208,12 +7289,12 @@ async function handleJson(
     }
 
     // ========================================================
-    // MODO ASSISTENTE - ADVERTÊNCIA DO ADM
+    // MODO ASSISTENTE - ADVERTÊNCIA TRANSMITIDA COMO PTT REAL
     // ========================================================
 
     if (
         data.type ===
-        "assistant_warning"
+        "assistant_warning_tx_request"
     ) {
         const channelId =
             String(data.channelId || "").trim();
@@ -7227,31 +7308,35 @@ async function handleJson(
                 channelId
             );
 
-        if (
-            !channelId ||
-            !channel ||
-            !ASSISTANT_WARNING_CODES.has(warning) ||
-            !isChannelOwnerUser(channel, ws.userId) ||
-            String(ws.activeChannelId || "") !== channelId
-        ) {
-            console.warn(
-                `[ASSISTANT DENIED] user=${ws.userId || "?"} ` +
-                `channel=${channelId || "?"} warning=${warning || "?"}`
-            );
-            return;
-        }
-
         const targetUserId =
             String(data.targetUserId || "").trim();
 
         const targetName =
             String(data.targetName || "").slice(0, 64);
 
-        /*
-         * Proteção adicional contra duplicação acidental de callbacks no
-         * cliente. Não muda as regras; apenas impede o mesmo aviso de ser
-         * retransmitido várias vezes em poucos instantes.
-         */
+        if (
+            !channelId ||
+            !channel ||
+            !ASSISTANT_WARNING_CODES.has(warning) ||
+            !isChannelOwnerUser(channel, ws.userId) ||
+            String(ws.activeChannelId || "") !== channelId ||
+            !ws.enabledChannelIds?.has(channelId) ||
+            !canClientTransmitOnChannel(ws, channelId)
+        ) {
+            console.warn(
+                `[ASSISTANT TX DENIED] user=${ws.userId || "?"} ` +
+                `channel=${channelId || "?"} warning=${warning || "?"}`
+            );
+
+            sendJson(ws, {
+                type: "assistant_warning_tx_denied",
+                channelId,
+                warning,
+                message: "Modo Assistente indisponível neste canal."
+            });
+            return;
+        }
+
         const cooldownKey =
             `${channelId}:${warning}:${targetUserId}`;
 
@@ -7261,26 +7346,111 @@ async function handleJson(
         );
 
         if (now - previous < 2_000) {
+            sendJson(ws, {
+                type: "assistant_warning_tx_denied",
+                channelId,
+                warning,
+                message: "Advertência duplicada ignorada."
+            });
             return;
         }
 
-        assistantWarningCooldowns.set(cooldownKey, now);
+        /*
+         * A advertência nunca mistura áudio com outro PTT. Se alguém já
+         * começou a falar, o Android mantém o aviso na fila e tenta de novo.
+         */
+        const active =
+            activeTransmitters.get(channelId);
+
+        if (
+            active ||
+            ws.txChannelId
+        ) {
+            sendJson(ws, {
+                type: "assistant_warning_tx_busy",
+                channelId,
+                warning,
+                message: "Canal ocupado; advertência aguardando."
+            });
+            return;
+        }
+
+        assistantWarningCooldowns.set(
+            cooldownKey,
+            now
+        );
+
+        /*
+         * O servidor reserva o canal ANTES de mandar o Android tocar/codificar
+         * o arquivo. Assim os frames binários da advertência percorrem o mesmo
+         * caminho de um PTT normal e não podem ser confundidos com microfone.
+         */
+        suspendReceiveForOwnTransmit(ws);
+
+        const txStartedAt = Date.now();
+
+        const state = {
+            userId: ws.userId,
+            name: "Assistente",
+            avatar: ws.avatar || "",
+            channelOwnerUid: String(channel?.ownerUid || ws.userId || ""),
+            startedAt: txStartedAt,
+            lastAudioAt: txStartedAt,
+            randomPriority: Math.random(),
+            audioPacketCount: 0,
+            audioBytesRelayed: 0,
+            bootstrapPackets: [],
+            assistantGenerated: true,
+            assistantWarning: warning,
+            assistantTargetUserId: targetUserId,
+            assistantTargetName: targetName
+        };
+
+        activeTransmitters.set(
+            channelId,
+            state
+        );
+
+        ws.txChannelId =
+            channelId;
 
         console.log(
-            `[ASSISTANT WARNING] channel=${channelId} ` +
+            `[ASSISTANT PTT START] channel=${channelId} ` +
             `warning=${warning} target=${targetUserId || "?"}`
         );
 
-        broadcastAssistantWarning(
+        /*
+         * Primeiro prepara os receptores. A janela normal de arbitragem é
+         * 60 ms; o grant sai depois dela para que start_tx chegue antes dos
+         * primeiros pacotes AMR-WB nos ouvintes.
+         */
+        forceAssistantWarningReceive(
             channelId,
-            {
-                type: "assistant_warning",
-                channelId,
-                warning,
-                targetUserId,
-                targetName,
-                issuedBy: ws.userId
-            }
+            ws.userId
+        );
+
+        setTimeout(
+            () => {
+                const stillActive =
+                    activeTransmitters.get(channelId);
+
+                if (
+                    !isOpen(ws) ||
+                    stillActive !== state ||
+                    ws.txChannelId !== channelId
+                ) {
+                    return;
+                }
+
+                sendJson(ws, {
+                    type: "assistant_warning_tx_granted",
+                    channelId,
+                    warning,
+                    targetUserId,
+                    targetName
+                });
+            },
+            RX_SIMULTANEOUS_WINDOW_MS + 40
         );
 
         return;
