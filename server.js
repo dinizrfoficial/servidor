@@ -5675,6 +5675,67 @@ function clientListFor(ws) {
         });
 }
 
+function assistantForClient(ws) {
+    const channelId =
+        uiChannelIdForClient(ws);
+
+    if (!channelId) {
+        return {
+            active: false,
+            name: "Z-Link",
+            avatar: ""
+        };
+    }
+
+    const channel = Array.isArray(ws?.channels)
+        ? ws.channels.find(
+            item => String(item.id) === String(channelId)
+        )
+        : null;
+
+    const ownerUid =
+        String(channel?.ownerUid || "");
+
+    if (!ownerUid) {
+        return {
+            active: false,
+            name: "Z-Link",
+            avatar: ""
+        };
+    }
+
+    const ownerSocket =
+        clients.get(ownerUid);
+
+    const active =
+        !!ownerSocket &&
+        isOpen(ownerSocket) &&
+        String(ownerSocket.assistantExclusiveChannelId || "") ===
+            String(channelId);
+
+    if (!active) {
+        return {
+            active: false,
+            name: "Z-Link",
+            avatar: ""
+        };
+    }
+
+    const name =
+        String(ownerSocket.assistantProfileName || "Z-Link")
+            .trim()
+            .slice(0, 32) || "Z-Link";
+
+    const avatar =
+        String(ownerSocket.assistantProfileAvatar || "");
+
+    return {
+        active: true,
+        name,
+        avatar
+    };
+}
+
 function sendJson(
     ws,
     data
@@ -5751,7 +5812,8 @@ function broadcastUserLists() {
         sendJson(ws, {
             type: "user_list",
             channelId: uiChannelIdForClient(ws),
-            clients: clientListFor(ws)
+            clients: clientListFor(ws),
+            assistant: assistantForClient(ws)
         });
     }
 }
@@ -6971,6 +7033,9 @@ async function handleJson(
                 clients:
                     clientListFor(ws),
 
+                assistant:
+                    assistantForClient(ws),
+
                 channels:
                     ws.channels,
 
@@ -7061,6 +7126,7 @@ async function handleJson(
                 ws,
                 null
             );
+            broadcastUserLists();
             return;
         }
 
@@ -7092,8 +7158,26 @@ async function handleJson(
                 channelId: requestedChannelId || null,
                 message: "O foco do Modo Assistente só pode ser usado pelo Administrador do canal aberto."
             });
+            broadcastUserLists();
             return;
         }
+
+        ws.assistantProfileName =
+            String(data.assistantName || "Z-Link")
+                .trim()
+                .slice(0, 32) || "Z-Link";
+
+        const requestedAvatar =
+            String(data.assistantAvatar || "");
+
+        /*
+         * O AvatarCodec do Android já comprime a imagem. Ainda assim,
+         * limita o tamanho recebido para impedir payloads abusivos.
+         */
+        ws.assistantProfileAvatar =
+            requestedAvatar.length <= 400000
+                ? requestedAvatar
+                : "";
 
         applyAssistantExclusiveFocus(
             ws,
@@ -7104,6 +7188,8 @@ async function handleJson(
             type: "assistant_focus_applied",
             channelId: requestedChannelId
         });
+
+        broadcastUserLists();
         return;
     }
 
