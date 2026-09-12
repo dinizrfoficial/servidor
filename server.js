@@ -587,6 +587,30 @@ async function refreshConnectedClientChannels(uid) {
                     : null;
         }
 
+        if (ws.assistantExclusiveChannelId) {
+            const focusChannel =
+                channelMetadataForClient(
+                    ws,
+                    ws.assistantExclusiveChannelId
+                );
+
+            if (
+                !focusChannel ||
+                !ws.enabledChannelIds.has(ws.assistantExclusiveChannelId) ||
+                String(ws.activeChannelId || "") !==
+                    String(ws.assistantExclusiveChannelId) ||
+                !isChannelOwnerUser(
+                    focusChannel,
+                    ws.userId
+                )
+            ) {
+                applyAssistantExclusiveFocus(
+                    ws,
+                    null
+                );
+            }
+        }
+
         /*
          * O canal atual pode ter prioridade sobre o padrão.
          * Só encerra o TX se o canal realmente deixou de estar habilitado.
@@ -6009,7 +6033,17 @@ function receiveCandidatesForClient(ws) {
 
     const candidates = [];
 
+    const assistantExclusiveChannelId =
+        String(ws.assistantExclusiveChannelId || "");
+
     for (const [channelId, state] of activeTransmitters) {
+        if (
+            assistantExclusiveChannelId &&
+            String(channelId) !== assistantExclusiveChannelId
+        ) {
+            continue;
+        }
+
         if (
             state.userId === ws.userId ||
             !canClientReceiveFromChannel(ws, channelId)
@@ -6175,6 +6209,61 @@ function ensureReceiveSelectionNow(
     return selected;
 }
 
+function applyAssistantExclusiveFocus(
+    ws,
+    channelId
+) {
+    const normalized =
+        channelId
+            ? String(channelId).trim()
+            : "";
+
+    const nextChannelId =
+        normalized || null;
+
+    if (
+        String(ws.assistantExclusiveChannelId || "") ===
+        String(nextChannelId || "")
+    ) {
+        return;
+    }
+
+    const previousRx = ws.rxChannelId || null;
+    ws.assistantExclusiveChannelId = nextChannelId;
+
+    clearReceiveSelectionTimer(ws);
+
+    if (previousRx) {
+        const previousState =
+            activeTransmitters.get(previousRx);
+
+        /*
+         * É uma troca técnica de foco, não o fim real do câmbio remoto.
+         * suppressRoger evita tocar Roger Bip apenas porque o Assistente
+         * concentrou/desconcentrou a escuta em um canal.
+         */
+        sendJson(ws, {
+            type: "stop_tx",
+            from: previousState?.userId || "",
+            channelId: previousRx,
+            suppressRoger: true,
+            reason: "assistant_focus"
+        });
+
+        ws.rxChannelId = null;
+    }
+
+    ensureReceiveSelectionNow(
+        ws,
+        false
+    );
+
+    sendJson(
+        ws,
+        buildChannelStateMessage(ws)
+    );
+}
+
 function scheduleReceiveSelection(ws) {
     if (
         !isOpen(ws) ||
@@ -6211,10 +6300,17 @@ function forceAssistantWarningReceive(
     transmitterUserId
 ) {
     for (const client of clients.values()) {
+        const exclusiveChannelId =
+            String(client.assistantExclusiveChannelId || "");
+
         if (
             !isOpen(client) ||
             client.userId === transmitterUserId ||
             client.txChannelId ||
+            (
+                exclusiveChannelId &&
+                exclusiveChannelId !== String(channelId)
+            ) ||
             !canClientReceiveFromChannel(client, channelId)
         ) {
             continue;
@@ -6788,6 +6884,8 @@ async function handleJson(
                     ? ws.defaultChannelId
                     : null;
 
+            ws.assistantExclusiveChannelId = null;
+
         } catch (error) {
             console.error(
                 `[IDENTIFY CHANNELS] uid=${userId} ${error.message}`
@@ -6798,6 +6896,7 @@ async function handleJson(
             ws.blockedChannelIds = new Set();
             ws.defaultChannelId = null;
             ws.activeChannelId = null;
+            ws.assistantExclusiveChannelId = null;
         }
 
         ws.txChannelId =
@@ -6946,6 +7045,69 @@ async function handleJson(
     }
 
     // ========================================================
+    // MODO ASSISTENTE - FOCO EXCLUSIVO DE RECEPÇÃO
+    // ========================================================
+
+    if (
+        data.type ===
+        "assistant_focus"
+    ) {
+        const enabled = data.enabled === true;
+        const requestedChannelId =
+            String(data.channelId || "").trim();
+
+        if (!enabled) {
+            applyAssistantExclusiveFocus(
+                ws,
+                null
+            );
+            return;
+        }
+
+        const channel =
+            channelMetadataForClient(
+                ws,
+                requestedChannelId
+            );
+
+        const allowed =
+            !!requestedChannelId &&
+            !!channel &&
+            ws.enabledChannelIds?.has(requestedChannelId) &&
+            String(ws.activeChannelId || "") ===
+                requestedChannelId &&
+            isChannelOwnerUser(
+                channel,
+                ws.userId
+            );
+
+        if (!allowed) {
+            applyAssistantExclusiveFocus(
+                ws,
+                null
+            );
+
+            sendJson(ws, {
+                type: "assistant_focus_denied",
+                channelId: requestedChannelId || null,
+                message: "O foco do Modo Assistente só pode ser usado pelo Administrador do canal aberto."
+            });
+            return;
+        }
+
+        applyAssistantExclusiveFocus(
+            ws,
+            requestedChannelId
+        );
+
+        sendJson(ws, {
+            type: "assistant_focus_applied",
+            channelId: requestedChannelId
+        });
+        return;
+    }
+
+    // ========================================================
     // SELECT ACTIVE CHANNEL
     // ========================================================
 
@@ -6985,6 +7147,22 @@ async function handleJson(
                 }
             );
             return;
+        }
+
+        /*
+         * Ao trocar de tela, um foco exclusivo antigo não pode continuar
+         * prendendo a recepção no canal anterior. O Android enviará um novo
+         * assistant_focus se o novo canal também for elegível.
+         */
+        if (
+            ws.assistantExclusiveChannelId &&
+            String(ws.assistantExclusiveChannelId) !==
+                requestedChannelId
+        ) {
+            applyAssistantExclusiveFocus(
+                ws,
+                null
+            );
         }
 
         /*
@@ -7650,6 +7828,9 @@ wss.on(
             null;
 
         ws.activeChannelId =
+            null;
+
+        ws.assistantExclusiveChannelId =
             null;
 
         ws.txChannelId =
