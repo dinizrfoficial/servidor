@@ -6202,16 +6202,26 @@ function stopSelectedChannelForClients(
     for (const client of clients.values()) {
         if (
             !isOpen(client) ||
-            client.rxChannelId !== channelId
+            !isClientOnChannel(client, channelId)
         ) {
             continue;
         }
 
+        /*
+         * Envia stop_tx para TODOS os clientes que participam do canal,
+         * não somente para quem estava com rxChannelId selecionado.
+         * Isso limpa também qualquer indicador visual de PTT que possa ter
+         * ficado na tela do canal após queda abrupta do transmissor.
+         */
         sendJson(client, {
             type: "stop_tx",
             from: userId,
             channelId
         });
+
+        if (client.rxChannelId !== channelId) {
+            continue;
+        }
 
         client.rxChannelId = null;
 
@@ -7037,11 +7047,22 @@ async function handleJson(
             resetTransmitterIf(ws.userId);
         }
 
+        const txStartedAt =
+            Date.now();
+
         const state = {
             userId: ws.userId,
             name: ws.name,
             avatar: ws.avatar || "",
-            startedAt: Date.now(),
+            startedAt: txStartedAt,
+
+            /*
+             * Watchdog específico do PTT. Se o aparelho apagar ou perder
+             * totalmente a internet durante a transmissão, não haverá
+             * stop_tx. Enquanto o TX está saudável, cada pacote de áudio
+             * renova lastAudioAt.
+             */
+            lastAudioAt: txStartedAt,
             randomPriority: Math.random(),
             audioPacketCount: 0,
             audioBytesRelayed: 0,
@@ -7353,6 +7374,7 @@ wss.on(
 
                     txState.audioPacketCount++;
                     txState.audioBytesRelayed += data.length;
+                    txState.lastAudioAt = Date.now();
 
                     /*
                      * Preserva somente os primeiros frames do TX.
@@ -7510,6 +7532,86 @@ wss.on(
             }
         );
     }
+);
+
+// ============================================================
+// PTT TX WATCHDOG
+// ============================================================
+
+/*
+ * O heartbeat da presença continua sendo a autoridade para marcar o usuário
+ * offline. Este watchdog tem outro objetivo: impedir que o CANAL fique preso
+ * em estado de transmissão se o telefone desligar/perder internet exatamente
+ * enquanto o PTT está pressionado.
+ *
+ * Durante um TX normal chegam quadros de áudio continuamente, inclusive no
+ * silêncio. Se nenhum quadro chegar por este período, a transmissão é
+ * considerada abandonada e o canal é liberado.
+ */
+const TX_AUDIO_STALL_TIMEOUT_MS =
+    6_000;
+
+const TX_WATCHDOG_INTERVAL_MS =
+    1_000;
+
+setInterval(
+    () => {
+        const now = Date.now();
+        const usersToReset = new Set();
+
+        for (const [channelId, state] of activeTransmitters) {
+            const userId = String(state?.userId || "");
+
+            if (!userId) {
+                activeTransmitters.delete(channelId);
+                continue;
+            }
+
+            const txWs = clients.get(userId);
+
+            /*
+             * Se a presença já sumiu ou o socket deixou de ser utilizável,
+             * libera o TX imediatamente neste ciclo, sem esperar outro evento.
+             */
+            if (!txWs || !isOpen(txWs)) {
+                usersToReset.add(userId);
+                continue;
+            }
+
+            const lastAudioAt = Number(
+                state.lastAudioAt || state.startedAt || 0
+            );
+
+            if (
+                lastAudioAt > 0 &&
+                now - lastAudioAt >= TX_AUDIO_STALL_TIMEOUT_MS
+            ) {
+                console.warn(
+                    `[TX WATCHDOG] áudio parou; liberando canal ` +
+                    `user=${userId} channel=${channelId} ` +
+                    `idleMs=${now - lastAudioAt}`
+                );
+
+                usersToReset.add(userId);
+
+                /*
+                 * Se o socket ainda estiver vivo, avisa o próprio app para
+                 * soltar o estado local de transmissão também.
+                 */
+                sendJson(txWs, {
+                    type: "tx_denied",
+                    code: "TX_AUDIO_TIMEOUT",
+                    channelId,
+                    message: "Transmissão encerrada por perda de áudio/conexão."
+                });
+            }
+        }
+
+        for (const userId of usersToReset) {
+            resetTransmitterIf(userId);
+        }
+    },
+    TX_WATCHDOG_INTERVAL_MS
 );
 
 // ============================================================
