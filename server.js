@@ -389,6 +389,40 @@ function canModerateChannel(channel, uid) {
     );
 }
 
+/*
+ * CONFIANÇA DO CANAL
+ *
+ * - O Administrador/criador é sempre confiável.
+ * - Moderadores são sempre confiáveis.
+ * - Usuários comuns só são confiáveis quando possuem registro em
+ *   channels/{channelId}/trustedUsers/{uid}.
+ *
+ * A confiança é persistente enquanto o usuário mantiver o canal na lista.
+ * Ao remover o canal ou ser bloqueado, o registro de confiança é removido.
+ */
+function isChannelTrustedUser(channel, uid) {
+    const normalizedUid = String(uid || "").trim();
+
+    if (!normalizedUid) {
+        return false;
+    }
+
+    if (
+        isChannelOwnerUser(channel, normalizedUid) ||
+        isChannelModerator(channel, normalizedUid)
+    ) {
+        return true;
+    }
+
+    return (
+        !!channel?.trustedUsers &&
+        Object.prototype.hasOwnProperty.call(
+            channel.trustedUsers,
+            normalizedUid
+        )
+    );
+}
+
 function updateInMemoryChannelModerators(channelId, channel) {
     const moderatorUids =
         getChannelModeratorUids(channel);
@@ -459,6 +493,12 @@ async function getUserChannels(uid) {
 
             // Compatibilidade com versões antigas do Android.
             adminUids: getChannelModeratorUids(channel),
+
+            /*
+             * Confiança individual deste usuário neste canal.
+             * Owner e Moderador são considerados confiáveis implicitamente.
+             */
+            trusted: isChannelTrustedUser(channel, uid),
 
             avatar: sanitizeAvatar(channel.avatar),
             blocked,
@@ -553,26 +593,41 @@ async function refreshConnectedClientChannels(uid) {
          */
         if (
             previousTxChannelId &&
-            !ws.enabledChannelIds.has(
+            !canClientTransmitOnChannel(
+                ws,
                 previousTxChannelId
             )
         ) {
+            const channelStillEnabled =
+                ws.enabledChannelIds.has(
+                    previousTxChannelId
+                );
+
             resetTransmitterIf(uid);
 
             sendJson(ws, {
                 type: "tx_denied",
-                code: "CHANNEL_CHANGED",
-                message: "O canal de transmissão deixou de estar ativo."
+                code: channelStillEnabled
+                    ? "TRUST_REQUIRED"
+                    : "CHANNEL_CHANGED",
+                channelId: previousTxChannelId,
+                message: channelStillEnabled
+                    ? "Você não é confiável neste canal. A transmissão foi encerrada."
+                    : "O canal de transmissão deixou de estar ativo."
             });
         }
 
         /*
-         * Se o canal que estava sendo ouvido deixou de estar marcado,
+         * Se o canal que estava sendo ouvido deixou de estar marcado
+         * OU deixou de permitir RX (canal privado + não confiável),
          * abandona-o e escolhe a próxima transmissão válida.
          */
         if (
             ws.rxChannelId &&
-            !ws.enabledChannelIds.has(ws.rxChannelId)
+            !canClientReceiveFromChannel(
+                ws,
+                ws.rxChannelId
+            )
         ) {
             sendJson(ws, {
                 type: "stop_tx",
@@ -1639,7 +1694,8 @@ async function handleRemoveChannel(req, res) {
             isChannelModerator(channel, decoded.uid);
 
         const updates = {
-            [`users/${decoded.uid}/channels/${channelId}`]: null
+            [`users/${decoded.uid}/channels/${channelId}`]: null,
+            [`channels/${channelId}/trustedUsers/${decoded.uid}`]: null
         };
 
         if (wasModerator) {
@@ -1987,6 +2043,12 @@ async function handleBlockChannelUser(req, res) {
             blockedBy: decoded.uid
         };
 
+        /*
+         * Usuário bloqueado perde a confiança do canal.
+         * Ao ser desbloqueado, volta como Não Confiável.
+         */
+        updates[`channels/${channelId}/trustedUsers/${targetUid}`] = null;
+
         if (actorIsOwner && targetIsModerator) {
             updates[`channels/${channelId}/moderators/${targetUid}`] = null;
 
@@ -2207,6 +2269,19 @@ async function handleMakeChannelModerator(req, res) {
             return;
         }
 
+        /*
+         * Regra nova:
+         * somente usuário comum já marcado como Confiável
+         * pode ser promovido a Moderador.
+         */
+        if (!isChannelTrustedUser(channel, targetUid)) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Torne este usuário confiável antes de promovê-lo a Moderador"
+            });
+            return;
+        }
+
         const membership = await db
             .ref(`users/${targetUid}/channels/${channelId}`)
             .get();
@@ -2349,6 +2424,16 @@ async function handleRemoveChannelModerator(req, res) {
             // Remove também eventual registro legado.
             [`channels/${channelId}/admins/${targetUid}`]: null,
 
+            /*
+             * Moderadores são sempre confiáveis. Ao remover a função,
+             * mantemos o usuário como Confiável até a Moderação decidir
+             * explicitamente removê-lo dessa condição.
+             */
+            [`channels/${channelId}/trustedUsers/${targetUid}`]: {
+                trustedAt: now,
+                trustedBy: decoded.uid
+            },
+
             [`channels/${channelId}/updatedAt`]: now
         });
 
@@ -2387,6 +2472,152 @@ async function handleRemoveChannelModerator(req, res) {
         });
     }
 }
+
+
+async function handleSetChannelUserTrusted(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const targetUid = String(body.userId || "").trim();
+    const trusted = body.trusted === true;
+
+    if (!targetUid) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    try {
+        const channel = await getManagedChannelOrRespond(
+            res,
+            decoded.uid,
+            channelId
+        );
+        if (!channel) return;
+
+        const targetIsOwner =
+            isChannelOwnerUser(channel, targetUid);
+
+        const targetIsModerator =
+            isChannelModerator(channel, targetUid);
+
+        /*
+         * Owner e Moderadores são confiáveis por definição.
+         * A opção Confiável/Não Confiável vale para usuários comuns.
+         */
+        if (targetIsOwner || targetIsModerator) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Administrador e Moderadores são sempre confiáveis"
+            });
+            return;
+        }
+
+        if (
+            channel.blockedUsers &&
+            Object.prototype.hasOwnProperty.call(
+                channel.blockedUsers,
+                targetUid
+            )
+        ) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Desbloqueie este usuário antes de alterar a confiança"
+            });
+            return;
+        }
+
+        const membershipSnapshot = await db
+            .ref(`users/${targetUid}/channels/${channelId}`)
+            .get();
+
+        if (!membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Este usuário não participa do canal"
+            });
+            return;
+        }
+
+        const now = Date.now();
+
+        const updates = {
+            [`channels/${channelId}/updatedAt`]: now
+        };
+
+        if (trusted) {
+            updates[`channels/${channelId}/trustedUsers/${targetUid}`] = {
+                trustedAt: now,
+                trustedBy: decoded.uid
+            };
+        } else {
+            updates[`channels/${channelId}/trustedUsers/${targetUid}`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        /*
+         * Se a confiança foi removida durante um TX, encerra imediatamente.
+         * Em canal privado, refreshConnectedClientChannels também encerra RX.
+         */
+        if (!trusted) {
+            resetTransmitterIf(targetUid);
+        }
+
+        await refreshConnectedClientChannels(targetUid);
+        broadcastUserLists();
+
+        console.log(
+            `[CHANNEL TRUST] actor=${decoded.uid} target=${targetUid} ` +
+            `channel=${channelId} trusted=${trusted}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: targetUid,
+            trusted
+        });
+
+    } catch (error) {
+        console.error("[CHANNEL TRUST]", error.message);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar a confiança do usuário"
+        });
+    }
+}
+
 
 async function handleListBlockedChannelUsers(req, res) {
     if (!firebaseReady || !db || !auth) {
@@ -5019,6 +5250,14 @@ const httpServer =
 
             if (
                 req.method === "POST" &&
+                req.url === "/api/channels/set-trusted"
+            ) {
+                await handleSetChannelUserTrusted(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
                 (
                     req.url === "/api/channels/make-moderator" ||
                     req.url === "/api/channels/make-admin"
@@ -5146,6 +5385,111 @@ function isClientOnChannel(client, channelId) {
     );
 }
 
+function channelMetadataForClient(client, channelId) {
+    if (
+        !client ||
+        !channelId ||
+        !Array.isArray(client.channels)
+    ) {
+        return null;
+    }
+
+    return (
+        client.channels.find(
+            item =>
+                String(item?.id || "") ===
+                String(channelId || "")
+        ) || null
+    );
+}
+
+function isClientTrustedOnChannel(client, channelId) {
+    const channel =
+        channelMetadataForClient(
+            client,
+            channelId
+        );
+
+    if (!channel) {
+        return false;
+    }
+
+    const uid =
+        String(
+            client?.userId || ""
+        );
+
+    const isOwner =
+        String(
+            channel.ownerUid || ""
+        ) === uid;
+
+    const moderatorUids =
+        new Set(
+            (
+                Array.isArray(channel.moderatorUids)
+                    ? channel.moderatorUids
+                    : (
+                        Array.isArray(channel.adminUids)
+                            ? channel.adminUids
+                            : []
+                    )
+            )
+                .map(value => String(value || ""))
+                .filter(Boolean)
+        );
+
+    return (
+        isOwner ||
+        moderatorUids.has(uid) ||
+        channel.trusted === true
+    );
+}
+
+function canClientTransmitOnChannel(client, channelId) {
+    return (
+        isClientOnChannel(client, channelId) &&
+        isClientTrustedOnChannel(client, channelId)
+    );
+}
+
+function canClientReceiveFromChannel(client, channelId) {
+    if (!isClientOnChannel(client, channelId)) {
+        return false;
+    }
+
+    const channel =
+        channelMetadataForClient(
+            client,
+            channelId
+        );
+
+    if (!channel) {
+        return false;
+    }
+
+    const type =
+        String(
+            channel.type || "public"
+        ).toLowerCase();
+
+    /*
+     * Canal público:
+     * Não confiável pode OUVIR, mas não transmitir.
+     *
+     * Canal privado:
+     * Não confiável não recebe start_tx nem áudio.
+     */
+    if (type !== "private") {
+        return true;
+    }
+
+    return isClientTrustedOnChannel(
+        client,
+        channelId
+    );
+}
+
 /*
  * Retorna true quando dois clientes compartilham pelo menos
  * um canal marcado/habilitado.
@@ -5263,6 +5607,14 @@ function clientListFor(ws) {
                     clientUid
                 );
 
+            const isTrusted =
+                isOwner ||
+                isModerator ||
+                isClientTrustedOnChannel(
+                    client,
+                    channelId
+                );
+
             return {
                 id:
                     client.userId,
@@ -5276,6 +5628,8 @@ function clientListFor(ws) {
                 isOwner,
 
                 isModerator,
+
+                isTrusted,
 
                 /*
                  * Compatibilidade com Android antigo.
@@ -5392,7 +5746,7 @@ function activeTransmittersForClient(ws) {
     if (
         !state ||
         state.userId === ws.userId ||
-        !isClientOnChannel(ws, channelId)
+        !canClientReceiveFromChannel(ws, channelId)
     ) {
         return [];
     }
@@ -5444,7 +5798,7 @@ function sendCurrentTransmitterStart(
         !ws.userId ||
         !channelId ||
         ws.rxChannelId !== channelId ||
-        !isClientOnChannel(ws, channelId)
+        !canClientReceiveFromChannel(ws, channelId)
     ) {
         return false;
     }
@@ -5658,7 +6012,7 @@ function receiveCandidatesForClient(ws) {
     for (const [channelId, state] of activeTransmitters) {
         if (
             state.userId === ws.userId ||
-            !isClientOnChannel(ws, channelId)
+            !canClientReceiveFromChannel(ws, channelId)
         ) {
             continue;
         }
@@ -5774,7 +6128,10 @@ function ensureReceiveSelectionNow(
         if (
             current &&
             current.userId !== ws.userId &&
-            isClientOnChannel(ws, ws.rxChannelId)
+            canClientReceiveFromChannel(
+                ws,
+                ws.rxChannelId
+            )
         ) {
             return ws.rxChannelId;
         }
@@ -6562,6 +6919,27 @@ async function handleJson(
         }
 
         /*
+         * Regra de confiança:
+         * - público: Não Confiável pode ouvir, mas não transmitir;
+         * - privado: Não Confiável não pode ouvir nem transmitir.
+         *
+         * A checagem aqui é obrigatória mesmo que o Android também
+         * bloqueie localmente o PTT.
+         */
+        if (!canClientTransmitOnChannel(ws, channelId)) {
+            sendJson(
+                ws,
+                {
+                    type: "tx_denied",
+                    code: "TRUST_REQUIRED",
+                    channelId,
+                    message: "Você ainda não é confiável neste canal. Aguarde um Administrador ou Moderador liberar sua transmissão."
+                }
+            );
+            return;
+        }
+
+        /*
          * O canal atualmente aberto pode superar o canal padrão.
          */
 
@@ -6928,7 +7306,10 @@ wss.on(
 
                     for (const client of clients.values()) {
                         if (
-                            isClientOnChannel(client, channelId) &&
+                            canClientReceiveFromChannel(
+                                client,
+                                channelId
+                            ) &&
                             client.rxChannelId === channelId &&
                             !client.txChannelId &&
                             client.userId !== ws.userId
