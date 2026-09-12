@@ -6307,6 +6307,12 @@ function preemptActiveTransmitter(
         current.userId ===
             interruptedUserId
     ) {
+        notifyAssistantOwnerTxStop(
+            channelId,
+            current,
+            "preempted"
+        );
+
         activeTransmitters.delete(
             channelId
         );
@@ -6358,7 +6364,8 @@ function isAudioPacket(
 
 function resetTransmitterIf(
     userId,
-    exceptId = null
+    exceptId = null,
+    assistantReason = "reset"
 ) {
     const stopped = [];
 
@@ -6366,6 +6373,12 @@ function resetTransmitterIf(
         if (state.userId !== userId) {
             continue;
         }
+
+        notifyAssistantOwnerTxStop(
+            channelId,
+            state,
+            assistantReason
+        );
 
         activeTransmitters.delete(channelId);
         stopped.push({ channelId, state });
@@ -6386,6 +6399,88 @@ function resetTransmitterIf(
     }
 
     return stopped;
+}
+
+// ============================================================
+// MODO ASSISTENTE
+// ============================================================
+
+const ASSISTANT_WARNING_CODES = new Set([
+    "long_exchange",
+    "repetitive_ptt",
+    "exchange_gap"
+]);
+
+const assistantWarningCooldowns = new Map();
+
+function notifyAssistantOwnerTxStart(channelId, state) {
+    const ownerUid = String(state?.channelOwnerUid || "");
+
+    if (!ownerUid) {
+        return;
+    }
+
+    const ownerWs = clients.get(ownerUid);
+
+    if (
+        !ownerWs ||
+        !isOpen(ownerWs) ||
+        String(ownerWs.activeChannelId || "") !== String(channelId)
+    ) {
+        return;
+    }
+
+    sendJson(ownerWs, {
+        type: "assistant_tx_start",
+        channelId,
+        userId: state.userId,
+        name: state.name || state.userId,
+        ts: Number(state.startedAt || Date.now())
+    });
+}
+
+function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
+    const ownerUid = String(state?.channelOwnerUid || "");
+
+    if (!ownerUid) {
+        return;
+    }
+
+    const ownerWs = clients.get(ownerUid);
+
+    if (
+        !ownerWs ||
+        !isOpen(ownerWs) ||
+        String(ownerWs.activeChannelId || "") !== String(channelId)
+    ) {
+        return;
+    }
+
+    const endedAt = Date.now();
+    const startedAt = Number(state?.startedAt || endedAt);
+
+    sendJson(ownerWs, {
+        type: "assistant_tx_stop",
+        channelId,
+        userId: state.userId,
+        name: state.name || state.userId,
+        ts: endedAt,
+        durationMs: Math.max(0, endedAt - startedAt),
+        reason
+    });
+}
+
+function broadcastAssistantWarning(channelId, data) {
+    for (const client of clients.values()) {
+        if (
+            !isOpen(client) ||
+            !canClientReceiveFromChannel(client, channelId)
+        ) {
+            continue;
+        }
+
+        sendJson(client, data);
+    }
 }
 
 // ============================================================
@@ -7050,10 +7145,17 @@ async function handleJson(
         const txStartedAt =
             Date.now();
 
+        const channelMetadata =
+            channelMetadataForClient(
+                ws,
+                channelId
+            );
+
         const state = {
             userId: ws.userId,
             name: ws.name,
             avatar: ws.avatar || "",
+            channelOwnerUid: String(channelMetadata?.ownerUid || ""),
             startedAt: txStartedAt,
 
             /*
@@ -7080,6 +7182,11 @@ async function handleJson(
             state
         );
 
+        notifyAssistantOwnerTxStart(
+            channelId,
+            state
+        );
+
         ws.txChannelId =
             channelId;
 
@@ -7096,6 +7203,85 @@ async function handleJson(
          * somente o canal vencedor da arbitragem multicanal.
          */
         scheduleReceiveForAllEligibleClients();
+
+        return;
+    }
+
+    // ========================================================
+    // MODO ASSISTENTE - ADVERTÊNCIA DO ADM
+    // ========================================================
+
+    if (
+        data.type ===
+        "assistant_warning"
+    ) {
+        const channelId =
+            String(data.channelId || "").trim();
+
+        const warning =
+            String(data.warning || "").trim();
+
+        const channel =
+            channelMetadataForClient(
+                ws,
+                channelId
+            );
+
+        if (
+            !channelId ||
+            !channel ||
+            !ASSISTANT_WARNING_CODES.has(warning) ||
+            !isChannelOwnerUser(channel, ws.userId) ||
+            String(ws.activeChannelId || "") !== channelId
+        ) {
+            console.warn(
+                `[ASSISTANT DENIED] user=${ws.userId || "?"} ` +
+                `channel=${channelId || "?"} warning=${warning || "?"}`
+            );
+            return;
+        }
+
+        const targetUserId =
+            String(data.targetUserId || "").trim();
+
+        const targetName =
+            String(data.targetName || "").slice(0, 64);
+
+        /*
+         * Proteção adicional contra duplicação acidental de callbacks no
+         * cliente. Não muda as regras; apenas impede o mesmo aviso de ser
+         * retransmitido várias vezes em poucos instantes.
+         */
+        const cooldownKey =
+            `${channelId}:${warning}:${targetUserId}`;
+
+        const now = Date.now();
+        const previous = Number(
+            assistantWarningCooldowns.get(cooldownKey) || 0
+        );
+
+        if (now - previous < 2_000) {
+            return;
+        }
+
+        assistantWarningCooldowns.set(cooldownKey, now);
+
+        console.log(
+            `[ASSISTANT WARNING] channel=${channelId} ` +
+            `warning=${warning} target=${targetUserId || "?"}`
+        );
+
+        broadcastAssistantWarning(
+            channelId,
+            {
+                type: "assistant_warning",
+                channelId,
+                warning,
+                targetUserId,
+                targetName,
+                issuedBy: ws.userId
+            }
+        );
 
         return;
     }
@@ -7135,7 +7321,8 @@ async function handleJson(
 
         resetTransmitterIf(
             ws.userId,
-            ws.userId
+            ws.userId,
+            "normal"
         );
 
         /*
