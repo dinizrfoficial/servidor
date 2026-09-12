@@ -7181,6 +7181,58 @@ async function handleJson(
 }
 
 // ============================================================
+// PRESENÇA / LIMPEZA DE CONEXÃO
+// ============================================================
+
+/*
+ * Remove uma conexão somente se ela ainda for a conexão corrente daquele
+ * usuário. Isso é importante porque, durante uma reconexão, o socket antigo
+ * pode fechar depois que o novo já foi registrado em clients.
+ *
+ * Retorna true quando houve remoção real da presença. O chamador decide se
+ * precisa fazer broadcast imediatamente ou agrupar várias remoções.
+ */
+function removeClientPresence(
+    ws,
+    reason = "disconnect",
+    broadcastNow = true
+) {
+    if (
+        !ws ||
+        !ws.userId
+    ) {
+        return false;
+    }
+
+    const userId =
+        ws.userId;
+
+    const isCurrentConnection =
+        clients.get(userId) === ws;
+
+    if (!isCurrentConnection) {
+        return false;
+    }
+
+    clearReceiveSelectionTimer(ws);
+
+    clients.delete(userId);
+
+    resetTransmitterIf(userId);
+
+    console.log(
+        `[PRESENCE OFFLINE] user=${userId} reason=${reason} ` +
+        `usuarios=${clients.size}`
+    );
+
+    if (broadcastNow) {
+        broadcastUserLists();
+    }
+
+    return true;
+}
+
+// ============================================================
 // WEBSOCKET CONNECTION
 // ============================================================
 
@@ -7234,12 +7286,18 @@ wss.on(
         ws.isAlive =
             true;
 
+        ws.lastSeenAt =
+            Date.now();
+
         ws.on(
             "pong",
             () => {
 
                 ws.isAlive =
                     true;
+
+                ws.lastSeenAt =
+                    Date.now();
             }
         );
 
@@ -7249,6 +7307,15 @@ wss.on(
                 data,
                 isBinary
             ) => {
+
+                /*
+                 * Qualquer tráfego válido do socket também prova que a
+                 * conexão continua viva. O pong do protocolo WebSocket é a
+                 * referência principal, mas isto dá uma proteção extra em
+                 * clientes/redes que estejam transportando áudio/controle.
+                 */
+                ws.isAlive = true;
+                ws.lastSeenAt = Date.now();
 
                 // ============================================
                 // AUDIO
@@ -7420,32 +7487,10 @@ wss.on(
 
                 clearReceiveSelectionTimer(ws);
 
-                if (
-                    !ws.userId
-                ) {
-
-                    return;
-                }
-
-                const wasCurrentConnection =
-                    clients.get(
-                        ws.userId
-                    ) === ws;
-
-                if (
-                    wasCurrentConnection
-                ) {
-
-                    clients.delete(
-                        ws.userId
-                    );
-
-                    resetTransmitterIf(
-                        ws.userId
-                    );
-
-                    broadcastUserLists();
-                }
+                removeClientPresence(
+                    ws,
+                    `close:${code}`
+                );
             }
         );
 
@@ -7471,15 +7516,30 @@ wss.on(
 // HEARTBEAT
 // ============================================================
 
+const HEARTBEAT_INTERVAL_MS =
+    10_000;
+
 setInterval(
     () => {
+        let presenceChanged =
+            false;
 
+        /*
+         * O protocolo é:
+         *  - ciclo atual: marca isAlive=false e envia ping;
+         *  - qualquer pong ou mensagem volta isAlive=true;
+         *  - se chegar ao próximo ciclo ainda false, a conexão morreu.
+         *
+         * Com 10 s, um desligamento abrupto ou perda total de internet é
+         * normalmente detectado em aproximadamente 10–20 segundos, sem
+         * depender de logout ou de o Android conseguir enviar "close".
+         */
         for (
             const [
                 userId,
                 ws
             ]
-            of clients
+            of [...clients]
         ) {
 
             if (
@@ -7488,23 +7548,25 @@ setInterval(
             ) {
 
                 console.log(
-                    `[HEARTBEAT] removendo conexão morta: ${userId}`
+                    `[HEARTBEAT] conexão sem resposta; marcando offline: ` +
+                    `${userId} lastSeen=${ws.lastSeenAt || 0}`
                 );
+
+                const removed =
+                    removeClientPresence(
+                        ws,
+                        "heartbeat_timeout",
+                        false
+                    );
+
+                presenceChanged =
+                    presenceChanged ||
+                    removed;
 
                 try {
-
                     ws.terminate();
-
                 } catch (_) {
                 }
-
-                clients.delete(
-                    userId
-                );
-
-                resetTransmitterIf(
-                    userId
-                );
 
                 continue;
             }
@@ -7516,12 +7578,42 @@ setInterval(
 
                 ws.ping();
 
-            } catch (_) {
+            } catch (error) {
+
+                console.warn(
+                    `[HEARTBEAT] falha ao enviar ping para ${userId}: ` +
+                    `${error.message}`
+                );
+
+                const removed =
+                    removeClientPresence(
+                        ws,
+                        "heartbeat_ping_error",
+                        false
+                    );
+
+                presenceChanged =
+                    presenceChanged ||
+                    removed;
+
+                try {
+                    ws.terminate();
+                } catch (_) {
+                }
             }
         }
 
+        /*
+         * Fundamental: avisa as telas imediatamente. Na versão anterior,
+         * o heartbeat removia do Map, mas não enviava user_list; por isso
+         * o nome podia continuar visível até outro evento acontecer.
+         */
+        if (presenceChanged) {
+            broadcastUserLists();
+        }
+
     },
-    30_000
+    HEARTBEAT_INTERVAL_MS
 );
 
 // ============================================================
