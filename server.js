@@ -5915,6 +5915,13 @@ function sendCurrentTransmitterStart(
             from: active.userId,
             name: active.name || active.userId,
             avatar: active.avatar || "",
+            assistantGenerated: !!active.assistantGenerated,
+            assistantName: active.assistantGenerated
+                ? String(active.assistantName || "Z-Link")
+                : "",
+            assistantAvatar: active.assistantGenerated
+                ? String(active.avatar || "")
+                : "",
             channelId,
             channelName: channel?.name || "Canal",
             elapsedMs:
@@ -7653,10 +7660,19 @@ async function handleJson(
 
         const txStartedAt = Date.now();
 
+        const assistantName =
+            String(ws.assistantProfileName || "Z-Link")
+                .trim()
+                .slice(0, 32) || "Z-Link";
+
+        const assistantAvatar =
+            String(ws.assistantProfileAvatar || "");
+
         const state = {
             userId: ws.userId,
             name: "Assistente",
-            avatar: ws.avatar || "",
+            assistantName,
+            avatar: assistantAvatar,
             channelOwnerUid: String(channel?.ownerUid || ws.userId || ""),
             startedAt: txStartedAt,
             lastAudioAt: txStartedAt,
