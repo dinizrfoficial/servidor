@@ -6602,6 +6602,25 @@ function resetTransmitterIf(
             channelId,
             userId
         );
+
+        /*
+         * A confirmação explícita é enviada DEPOIS do stop_tx normal.
+         * WebSocket preserva essa ordem; assim o Android nunca inicia um TX
+         * novo e depois recebe o STOP antigo da advertência por cima dele.
+         */
+        if (state.assistantGenerated) {
+            const assistantOwnerWs =
+                clients.get(String(state.userId || ""));
+
+            if (assistantOwnerWs && isOpen(assistantOwnerWs)) {
+                sendJson(assistantOwnerWs, {
+                    type: "assistant_warning_tx_finished",
+                    channelId,
+                    warning: String(state.assistantWarning || ""),
+                    ts: Date.now()
+                });
+            }
+        }
     }
 
     const ws = clients.get(userId);
