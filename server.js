@@ -1880,17 +1880,11 @@ async function handleSetOwnUsername(req, res) {
     /*
      * O índice de nomes é normalizado em minúsculas.
      * Portanto DANIEL, Daniel e daniel representam exatamente a mesma chave.
-     * Inclusive uma simples troca de maiúsculas/minúsculas do próprio nome
-     * não é tratada como um novo nome disponível.
+     * Porém, se essa chave já pertence ao próprio UID, a troca é permitida
+     * para atualizar somente a forma de exibição (ex.: paulo -> Paulo).
      */
-    if (oldKey && key === oldKey) {
-        sendHttpJson(res, 409, {
-            success: false,
-            code: "USERNAME_UNAVAILABLE",
-            error: "Este nome de usuário não está disponível porque já está em uso."
-        });
-        return;
-    }
+    const changingOnlyPresentation =
+        Boolean(oldKey && key === oldKey);
 
     const reservationId =
         `rename_${uid}_${crypto.randomBytes(12).toString("hex")}`;
@@ -1930,51 +1924,56 @@ async function handleSetOwnUsername(req, res) {
     };
 
     try {
-        const reservationResult =
-            await reservationRef.transaction(
-                current => {
-                    const now = Date.now();
+        if (!changingOnlyPresentation) {
+            const reservationResult =
+                await reservationRef.transaction(
+                    current => {
+                        const now = Date.now();
 
-                    if (
-                        current == null ||
-                        Number(current.expiresAt || 0) <= now
-                    ) {
-                        return {
-                            reservationId,
-                            uid,
-                            purpose: "rename",
-                            expiresAt:
-                                now + USERNAME_RESERVATION_MS
-                        };
+                        if (
+                            current == null ||
+                            Number(current.expiresAt || 0) <= now
+                        ) {
+                            return {
+                                reservationId,
+                                uid,
+                                purpose: "rename",
+                                expiresAt:
+                                    now + USERNAME_RESERVATION_MS
+                            };
+                        }
+
+                        return;
                     }
+                );
 
-                    return;
-                }
-            );
+            const savedReservation =
+                reservationResult.snapshot.val() || {};
 
-        const savedReservation =
-            reservationResult.snapshot.val() || {};
+            if (
+                !reservationResult.committed ||
+                savedReservation.reservationId !== reservationId
+            ) {
+                sendHttpJson(res, 409, {
+                    success: false,
+                    code: "USERNAME_UNAVAILABLE",
+                    error: "Este nome de usuário não está disponível porque já está em uso."
+                });
+                return;
+            }
 
-        if (
-            !reservationResult.committed ||
-            savedReservation.reservationId !== reservationId
-        ) {
-            sendHttpJson(res, 409, {
-                success: false,
-                code: "USERNAME_UNAVAILABLE",
-                error: "Este nome de usuário não está disponível porque já está em uso."
-            });
-            return;
+            reservationAcquired = true;
         }
-
-        reservationAcquired = true;
 
         const existing =
             await db
                 .ref(`usernames/${key}`)
                 .get();
 
-        if (existing.exists()) {
+        if (
+            existing.exists() &&
+            String(existing.val() || "") !== uid
+        ) {
             await releaseReservation();
 
             sendHttpJson(res, 409, {
@@ -1994,9 +1993,12 @@ async function handleSetOwnUsername(req, res) {
 
         /*
          * A reserva é removida no MESMO update que publica o novo nome.
-         * Assim não existe janela em que a reserva some antes do índice nascer.
+         * Em uma troca apenas de maiúsculas/minúsculas, nenhuma reserva nova
+         * é criada, pois a chave já pertence ao próprio usuário.
          */
-        updates[`usernameReservations/${key}`] = null;
+        if (reservationAcquired) {
+            updates[`usernameReservations/${key}`] = null;
+        }
 
         if (oldKey && oldKey !== key) {
             try {
