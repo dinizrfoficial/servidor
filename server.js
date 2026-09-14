@@ -587,6 +587,18 @@ async function refreshConnectedClientChannels(uid) {
                     : null;
         }
 
+        /*
+         * Presença visual é diferente de participação/RX multicanal.
+         * Se o canal deixou de estar habilitado, a tela não pode continuar
+         * marcada como "Neste canal".
+         */
+        if (
+            ws.visibleChannelId &&
+            !ws.enabledChannelIds.has(ws.visibleChannelId)
+        ) {
+            ws.visibleChannelId = null;
+        }
+
         if (ws.assistantExclusiveChannelId) {
             const focusChannel =
                 channelMetadataForClient(
@@ -5649,6 +5661,15 @@ function clientListFor(ws) {
                 avatar:
                     client.avatar || "",
 
+                /*
+                 * O usuário continua nesta lista porque está online e tem o
+                 * canal ativo. Este campo informa se a TELA deste canal está
+                 * realmente aberta/visível naquele aparelho.
+                 */
+                isInChannel:
+                    String(client.visibleChannelId || "") ===
+                        String(channelId),
+
                 isOwner,
 
                 isModerator,
@@ -6972,6 +6993,11 @@ async function handleJson(
                     ? ws.defaultChannelId
                     : null;
 
+            /*
+             * Só o Android novo informa quando uma PttActivity está de fato
+             * visível. Não presumimos que o canal padrão esteja aberto.
+             */
+            ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
 
         } catch (error) {
@@ -6984,6 +7010,7 @@ async function handleJson(
             ws.blockedChannelIds = new Set();
             ws.defaultChannelId = null;
             ws.activeChannelId = null;
+            ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
         }
 
@@ -7215,6 +7242,40 @@ async function handleJson(
             channelId: requestedChannelId
         });
 
+        broadcastUserLists();
+        return;
+    }
+
+    // ========================================================
+    // PRESENÇA VISUAL NA TELA DO CANAL
+    // ========================================================
+
+    if (
+        data.type ===
+        "channel_view_presence"
+    ) {
+        const requestedChannelId =
+            data.channelId == null
+                ? null
+                : String(data.channelId || "").trim() || null;
+
+        if (requestedChannelId) {
+            if (
+                !ws.enabledChannelIds?.has(requestedChannelId) ||
+                ws.blockedChannelIds?.has(requestedChannelId)
+            ) {
+                ws.visibleChannelId = null;
+            } else {
+                ws.visibleChannelId = requestedChannelId;
+            }
+        } else {
+            ws.visibleChannelId = null;
+        }
+
+        /*
+         * Não mexe em activeChannelId, RX, TX, canal padrão ou foco do
+         * Assistente. É apenas um estado visual para a lista de usuários.
+         */
         broadcastUserLists();
         return;
     }
@@ -7949,6 +8010,9 @@ wss.on(
             null;
 
         ws.activeChannelId =
+            null;
+
+        ws.visibleChannelId =
             null;
 
         ws.assistantExclusiveChannelId =
