@@ -1795,6 +1795,339 @@ async function handleSetUserAvatar(req, res) {
     });
 }
 
+
+// ============================================================
+// ALTERAR NOME DO PRÓPRIO USUÁRIO
+// ============================================================
+
+async function handleSetOwnUsername(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const uid =
+        String(decoded.uid || "").trim();
+
+    const username =
+        String(body.username || "").trim();
+
+    const validation =
+        validateUsername(username);
+
+    if (validation) {
+        sendHttpJson(res, 400, {
+            success: false,
+            code: "USERNAME_INVALID",
+            error: validation
+        });
+        return;
+    }
+
+    const key =
+        usernameKey(username);
+
+    let profile;
+    try {
+        profile = await getUserProfile(uid);
+    } catch (error) {
+        console.error(
+            "[USERNAME CHANGE][PROFILE]",
+            error.message
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar o perfil"
+        });
+        return;
+    }
+
+    const oldUsername =
+        String(profile.username || "").trim();
+
+    const oldKey =
+        String(
+            profile.usernameKey ||
+            usernameKey(oldUsername)
+        ).trim();
+
+    /*
+     * O índice de nomes é normalizado em minúsculas.
+     * Portanto DANIEL, Daniel e daniel representam exatamente a mesma chave.
+     * Inclusive uma simples troca de maiúsculas/minúsculas do próprio nome
+     * não é tratada como um novo nome disponível.
+     */
+    if (oldKey && key === oldKey) {
+        sendHttpJson(res, 409, {
+            success: false,
+            code: "USERNAME_UNAVAILABLE",
+            error: "Este nome de usuário não está disponível porque já está em uso."
+        });
+        return;
+    }
+
+    const reservationId =
+        `rename_${uid}_${crypto.randomBytes(12).toString("hex")}`;
+
+    const reservationRef =
+        db.ref(`usernameReservations/${key}`);
+
+    let reservationAcquired = false;
+
+    const releaseReservation = async () => {
+        if (!reservationAcquired) {
+            return;
+        }
+
+        try {
+            const snapshot =
+                await reservationRef.get();
+
+            const value =
+                snapshot.exists()
+                    ? snapshot.val() || {}
+                    : {};
+
+            if (
+                value.reservationId === reservationId
+            ) {
+                await reservationRef.remove();
+            }
+        } catch (error) {
+            console.error(
+                "[USERNAME CHANGE][RELEASE]",
+                error.message
+            );
+        }
+
+        reservationAcquired = false;
+    };
+
+    try {
+        const reservationResult =
+            await reservationRef.transaction(
+                current => {
+                    const now = Date.now();
+
+                    if (
+                        current == null ||
+                        Number(current.expiresAt || 0) <= now
+                    ) {
+                        return {
+                            reservationId,
+                            uid,
+                            purpose: "rename",
+                            expiresAt:
+                                now + USERNAME_RESERVATION_MS
+                        };
+                    }
+
+                    return;
+                }
+            );
+
+        const savedReservation =
+            reservationResult.snapshot.val() || {};
+
+        if (
+            !reservationResult.committed ||
+            savedReservation.reservationId !== reservationId
+        ) {
+            sendHttpJson(res, 409, {
+                success: false,
+                code: "USERNAME_UNAVAILABLE",
+                error: "Este nome de usuário não está disponível porque já está em uso."
+            });
+            return;
+        }
+
+        reservationAcquired = true;
+
+        const existing =
+            await db
+                .ref(`usernames/${key}`)
+                .get();
+
+        if (existing.exists()) {
+            await releaseReservation();
+
+            sendHttpJson(res, 409, {
+                success: false,
+                code: "USERNAME_UNAVAILABLE",
+                error: "Este nome de usuário não está disponível porque já está em uso."
+            });
+            return;
+        }
+
+        const updates = {};
+
+        updates[`users/${uid}/username`] = username;
+        updates[`users/${uid}/usernameKey`] = key;
+        updates[`users/${uid}/updatedAt`] = Date.now();
+        updates[`usernames/${key}`] = uid;
+
+        /*
+         * A reserva é removida no MESMO update que publica o novo nome.
+         * Assim não existe janela em que a reserva some antes do índice nascer.
+         */
+        updates[`usernameReservations/${key}`] = null;
+
+        if (oldKey && oldKey !== key) {
+            try {
+                const oldMapping =
+                    await db
+                        .ref(`usernames/${oldKey}`)
+                        .get();
+
+                if (
+                    !oldMapping.exists() ||
+                    String(oldMapping.val() || "") === uid
+                ) {
+                    updates[`usernames/${oldKey}`] = null;
+                }
+            } catch (error) {
+                console.error(
+                    "[USERNAME CHANGE][OLD KEY]",
+                    error.message
+                );
+
+                await releaseReservation();
+
+                sendHttpJson(res, 500, {
+                    success: false,
+                    error: "Não foi possível concluir a alteração do nome"
+                });
+                return;
+            }
+        }
+
+        await db.ref().update(updates);
+        reservationAcquired = false;
+
+        /*
+         * Mantém o displayName do Firebase Auth coerente com o perfil.
+         * O banco é a fonte oficial do nome público; falha aqui não desfaz
+         * uma alteração que já foi concluída atomicamente no Realtime Database.
+         */
+        try {
+            await auth.updateUser(uid, {
+                displayName: username
+            });
+        } catch (error) {
+            console.error(
+                "[USERNAME CHANGE][AUTH DISPLAY NAME]",
+                error.message
+            );
+        }
+
+        /*
+         * Atualização imediata dos clientes conectados, inclusive de uma
+         * transmissão que já esteja ativa no momento da troca.
+         */
+        try {
+            const ws =
+                clients.get(uid);
+
+            if (ws && isOpen(ws)) {
+                ws.name = username;
+
+                for (
+                    const state of
+                    activeTransmitters.values()
+                ) {
+                    if (state.userId === uid) {
+                        state.name = username;
+                    }
+                }
+
+                sendJson(ws, {
+                    type: "user_update",
+                    id: uid,
+                    name: username,
+                    avatar: ws.avatar || ""
+                });
+
+                for (
+                    const peer of
+                    clients.values()
+                ) {
+                    if (
+                        peer === ws ||
+                        !isOpen(peer) ||
+                        !shareAnyEnabledChannel(peer, ws)
+                    ) {
+                        continue;
+                    }
+
+                    sendJson(peer, {
+                        type: "user_update",
+                        id: uid,
+                        name: username,
+                        avatar: ws.avatar || ""
+                    });
+                }
+            }
+
+            broadcastUserLists();
+        } catch (error) {
+            console.error(
+                "[USERNAME CHANGE][WS SYNC]",
+                error.message
+            );
+        }
+
+        console.log(
+            `[USERNAME CHANGE] uid=${uid} old=${oldKey || "-"} new=${key}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            username,
+            usernameKey: key,
+            message: "Nome de usuário atualizado com sucesso!"
+        });
+
+    } catch (error) {
+        await releaseReservation();
+
+        console.error(
+            "[USERNAME CHANGE]",
+            error?.stack || error?.message || error
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar o nome de usuário. Tente novamente."
+        });
+    }
+}
+
 async function handleSetChannelAvatar(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -5734,6 +6067,21 @@ const httpServer =
                 return;
             }
 
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/users/username"
+            ) {
+
+                await handleSetOwnUsername(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
             // ------------------------------------------------
             // CHANNEL LIST
             // ------------------------------------------------
@@ -7562,6 +7910,21 @@ async function handleJson(
 
         try {
             const profile = await getUserProfile(userId);
+
+            /*
+             * O nome persistido no perfil é a fonte oficial. O valor enviado
+             * pelo cliente serve apenas como fallback para contas antigas.
+             */
+            ws.name =
+                String(
+                    profile.username ||
+                    ws.name ||
+                    "Anônimo"
+                )
+                    .trim()
+                    .slice(0, 32) ||
+                "Anônimo";
+
             ws.avatar = sanitizeAvatar(
                 profile.avatar ||
                 profile.avatarData ||
@@ -7569,7 +7932,7 @@ async function handleJson(
                 ws.avatar
             );
         } catch (_) {
-            // Mantém o avatar do token ou vazio.
+            // Mantém nome/avatar do token/cliente como fallback.
         }
 
         try {
