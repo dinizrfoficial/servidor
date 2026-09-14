@@ -7686,6 +7686,17 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
     const endedAt = Date.now();
     const startedAt = Number(state?.startedAt || endedAt);
 
+    /*
+     * tx_voice_end representa o fim REAL da fala humana antes da cauda
+     * do Roger Bip TX. Para as regras do Assistente ele é um encerramento
+     * normal de PTT; normalizamos aqui para manter compatibilidade também
+     * com clientes anteriores que só reconhecem "normal"/"preempted".
+     */
+    const assistantReason =
+        reason === "voice_end"
+            ? "normal"
+            : reason;
+
     sendJson(ownerWs, {
         type: "assistant_tx_stop",
         channelId,
@@ -7693,7 +7704,7 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
         name: state.name || state.userId,
         ts: endedAt,
         durationMs: Math.max(0, endedAt - startedAt),
-        reason
+        reason: assistantReason
     });
 }
 
