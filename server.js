@@ -6816,6 +6816,13 @@ function activeTransmittersForClient(ws) {
         id: state.userId,
         name: state.name || state.userId,
         avatar: state.avatar || "",
+        assistantGenerated: !!state.assistantGenerated,
+        assistantName: state.assistantGenerated
+            ? String(state.assistantName || "Z-Link")
+            : "",
+        assistantAvatar: state.assistantGenerated
+            ? String(state.avatar || "")
+            : "",
         elapsedMs:
             state.startedAt > 0
                 ? Math.max(0, Date.now() - state.startedAt)
@@ -8090,6 +8097,12 @@ async function handleJson(
                             id: activeForClient[0].id,
                             name: activeForClient[0].name,
                             avatar: activeForClient[0].avatar || "",
+                            assistantGenerated:
+                                !!activeForClient[0].assistantGenerated,
+                            assistantName:
+                                activeForClient[0].assistantName || "",
+                            assistantAvatar:
+                                activeForClient[0].assistantAvatar || "",
                             channelId: activeForClient[0].channelId
                         }
                         : null
