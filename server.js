@@ -7653,9 +7653,19 @@ function notifyAssistantOwnerTxStart(channelId, state) {
 }
 
 function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
-    if (state?.assistantGenerated) {
+    if (
+        state?.assistantGenerated ||
+        state?.assistantMonitorEnded
+    ) {
         return;
     }
+
+    /*
+     * O fim da fala humana pode chegar antes do stop_tx quando existe
+     * Roger Bip TX. Marcamos aqui para que o stop_tx posterior não conte
+     * o Roger como parte da duração usada pelas regras do Assistente.
+     */
+    state.assistantMonitorEnded = true;
 
     const ownerUid = String(state?.channelOwnerUid || "");
 
@@ -8603,6 +8613,51 @@ async function handleJson(
          * somente o canal vencedor da arbitragem multicanal.
          */
         scheduleReceiveForAllEligibleClients();
+
+        return;
+    }
+
+    // ========================================================
+    // FIM DA FALA HUMANA / CAUDA DE ROGER BIP TX
+    // ========================================================
+
+    if (
+        data.type ===
+        "tx_voice_end"
+    ) {
+        const requestedChannelId =
+            String(data.channelId || "").trim();
+
+        const channelId =
+            ws.txChannelId || null;
+
+        const state =
+            channelId
+                ? activeTransmitters.get(channelId)
+                : null;
+
+        /*
+         * Este controle NÃO encerra o PTT. Ele informa somente que o
+         * microfone/fala humana terminou. Se houver Roger Bip TX, o canal
+         * continua reservado e os próximos frames binários ainda pertencem
+         * ao mesmo transmissor até chegar o stop_tx normal.
+         *
+         * Isso evita que Câmbio Espada / PTT Repetitivo / Espaço de Câmbio
+         * contabilizem a duração do Roger Bip como se fosse voz do usuário.
+         */
+        if (
+            channelId &&
+            (!requestedChannelId || requestedChannelId === channelId) &&
+            state &&
+            state.userId === ws.userId &&
+            !state.assistantGenerated
+        ) {
+            notifyAssistantOwnerTxStop(
+                channelId,
+                state,
+                "voice_end"
+            );
+        }
 
         return;
     }
