@@ -7661,9 +7661,10 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
     }
 
     /*
-     * O fim da fala humana pode chegar antes do stop_tx quando existe
-     * Roger Bip TX. Marcamos aqui para que o stop_tx posterior não conte
-     * o Roger como parte da duração usada pelas regras do Assistente.
+     * O encerramento do Modo Assistente acontece uma única vez, somente
+     * quando a transmissão realmente termina. Se houver Roger Bip TX,
+     * o stop_tx chega apenas depois do último frame do bip; assim VOZ +
+     * ROGER ocupam uma única janela contínua de transmissão.
      */
     state.assistantMonitorEnded = true;
 
@@ -7686,17 +7687,6 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
     const endedAt = Date.now();
     const startedAt = Number(state?.startedAt || endedAt);
 
-    /*
-     * tx_voice_end representa o fim REAL da fala humana antes da cauda
-     * do Roger Bip TX. Para as regras do Assistente ele é um encerramento
-     * normal de PTT; normalizamos aqui para manter compatibilidade também
-     * com clientes anteriores que só reconhecem "normal"/"preempted".
-     */
-    const assistantReason =
-        reason === "voice_end"
-            ? "normal"
-            : reason;
-
     sendJson(ownerWs, {
         type: "assistant_tx_stop",
         channelId,
@@ -7704,7 +7694,7 @@ function notifyAssistantOwnerTxStop(channelId, state, reason = "stop") {
         name: state.name || state.userId,
         ts: endedAt,
         durationMs: Math.max(0, endedAt - startedAt),
-        reason: assistantReason
+        reason
     });
 }
 
@@ -8629,47 +8619,21 @@ async function handleJson(
     }
 
     // ========================================================
-    // FIM DA FALA HUMANA / CAUDA DE ROGER BIP TX
+    // COMPATIBILIDADE: FIM DO MICROFONE ANTES DO ROGER BIP TX
     // ========================================================
 
     if (
         data.type ===
         "tx_voice_end"
     ) {
-        const requestedChannelId =
-            String(data.channelId || "").trim();
-
-        const channelId =
-            ws.txChannelId || null;
-
-        const state =
-            channelId
-                ? activeTransmitters.get(channelId)
-                : null;
-
         /*
-         * Este controle NÃO encerra o PTT. Ele informa somente que o
-         * microfone/fala humana terminou. Se houver Roger Bip TX, o canal
-         * continua reservado e os próximos frames binários ainda pertencem
-         * ao mesmo transmissor até chegar o stop_tx normal.
+         * Clientes antigos podem ainda enviar este marcador ao soltar o PTT.
+         * Ele NÃO encerra mais a transmissão para o Modo Assistente.
          *
-         * Isso evita que Câmbio Espada / PTT Repetitivo / Espaço de Câmbio
-         * contabilizem a duração do Roger Bip como se fosse voz do usuário.
+         * Se houver Roger Bip TX, o canal continua ocupado até o stop_tx
+         * definitivo enviado depois que o bip terminar. Assim o Assistente
+         * mede e acompanha a transmissão completa: VOZ + ROGER BIP TX.
          */
-        if (
-            channelId &&
-            (!requestedChannelId || requestedChannelId === channelId) &&
-            state &&
-            state.userId === ws.userId &&
-            !state.assistantGenerated
-        ) {
-            notifyAssistantOwnerTxStop(
-                channelId,
-                state,
-                "voice_end"
-            );
-        }
-
         return;
     }
 
