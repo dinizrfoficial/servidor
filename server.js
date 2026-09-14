@@ -455,6 +455,62 @@ function updateInMemoryChannelAdmins(channelId, channel) {
     );
 }
 
+function buildRemovedChannelMembership(
+    membership,
+    channel,
+    reason,
+    removedAt = Date.now()
+) {
+    const current = membership || {};
+    const source = channel || {};
+
+    return {
+        enabled: false,
+        addedAt: Number(current.addedAt || removedAt),
+        removed: true,
+        removedReason: String(reason || "owner_deleted"),
+        removedAt: Number(removedAt),
+        /*
+         * Tombstone mínimo: não duplica avatar, descrição ou UID do dono.
+         * Mantemos apenas o necessário para o antigo participante reconhecer
+         * o item na própria lista e saber por que não pode mais abri-lo.
+         */
+        removedChannel: {
+            name: source.name || "Canal",
+            type: source.type || "public"
+        }
+    };
+}
+
+function removedChannelMessage(reason) {
+    if (String(reason || "") === "owner_account_deleted") {
+        return "Este canal foi removido porque a conta do proprietário foi excluída.";
+    }
+
+    return "Este canal foi removido pelo proprietário.";
+}
+
+function sendChannelRemovedEvent(
+    uid,
+    channelId,
+    channel,
+    reason
+) {
+    const ws = clients.get(String(uid || ""));
+
+    if (!ws || !isOpen(ws)) {
+        return;
+    }
+
+    sendJson(ws, {
+        type: "channel_removed",
+        channelId: String(channelId || ""),
+        channelName: channel?.name || "Canal",
+        reason: String(reason || "owner_deleted"),
+        message: removedChannelMessage(reason)
+    });
+}
+
 async function getUserChannels(uid) {
     const membershipSnapshot = await db
         .ref(`users/${uid}/channels`)
@@ -466,12 +522,44 @@ async function getUserChannels(uid) {
 
     const result = [];
 
-    for (const [channelId, membership] of Object.entries(memberships)) {
+    for (const [channelId, membershipValue] of Object.entries(memberships)) {
+        const membership = membershipValue || {};
         const channelSnapshot = await db
             .ref(`channels/${channelId}`)
             .get();
 
         if (!channelSnapshot.exists()) {
+            /*
+             * Um canal removido pelo proprietário permanece como um registro
+             * desativado na lista dos antigos participantes. Isso permite
+             * explicar por que ele não pode mais ser aberto e ainda dá ao
+             * usuário a opção de removê-lo definitivamente da própria lista.
+             */
+            if (membership.removed === true) {
+                const removed = membership.removedChannel || {};
+                const reason = String(
+                    membership.removedReason || "owner_deleted"
+                );
+
+                result.push({
+                    id: channelId,
+                    name: removed.name || "Canal removido",
+                    description: "",
+                    type: removed.type || "public",
+                    ownerUid: "",
+                    moderatorUids: [],
+                    adminUids: [],
+                    trusted: false,
+                    avatar: "",
+                    blocked: false,
+                    enabled: false,
+                    removed: true,
+                    removedReason: reason,
+                    removedMessage: removedChannelMessage(reason),
+                    addedAt: Number(membership.addedAt || 0)
+                });
+            }
+
             continue;
         }
 
@@ -502,8 +590,11 @@ async function getUserChannels(uid) {
 
             avatar: sanitizeAvatar(channel.avatar),
             blocked,
-            enabled: !blocked && membership?.enabled !== false,
-            addedAt: Number(membership?.addedAt || 0)
+            enabled: !blocked && membership.enabled !== false,
+            removed: false,
+            removedReason: "",
+            removedMessage: "",
+            addedAt: Number(membership.addedAt || 0)
         });
     }
 
@@ -1066,6 +1157,432 @@ async function handleAddChannel(req, res) {
 }
 
 
+
+async function handleDeleteOwnAccount(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    const uid = String(decoded.uid || "").trim();
+
+    if (!uid) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Usuário inválido"
+        });
+        return;
+    }
+
+    /*
+     * Exclusão de conta exige autenticação recente.
+     * O Android faz reauthenticate(email + senha) e força um novo ID token.
+     * Assim, possuir apenas um token antigo não é suficiente para apagar a conta.
+     */
+    const authTimeMs =
+        Number(decoded.auth_time || 0) * 1000;
+
+    const now = Date.now();
+
+    if (
+        !authTimeMs ||
+        now - authTimeMs > 5 * 60 * 1000
+    ) {
+        sendHttpJson(res, 403, {
+            success: false,
+            error: "Confirme sua senha novamente antes de excluir a conta."
+        });
+        return;
+    }
+
+    try {
+        const [
+            profileSnapshot,
+            usersSnapshot,
+            channelsSnapshot,
+            usernamesSnapshot
+        ] = await Promise.all([
+            db.ref(`users/${uid}`).get(),
+            db.ref("users").get(),
+            db.ref("channels").get(),
+            db.ref("usernames").get()
+        ]);
+
+        const profile =
+            profileSnapshot.exists()
+                ? profileSnapshot.val() || {}
+                : {};
+
+        const allUsers =
+            usersSnapshot.exists()
+                ? usersSnapshot.val() || {}
+                : {};
+
+        const allChannels =
+            channelsSnapshot.exists()
+                ? channelsSnapshot.val() || {}
+                : {};
+
+        const allUsernames =
+            usernamesSnapshot.exists()
+                ? usernamesSnapshot.val() || {}
+                : {};
+
+        const updates = {};
+        const affectedUids = new Set();
+        const ownedChannelIds = new Set();
+        const ownedChannelsById = new Map();
+        const removedChannelsByUid = new Map();
+
+        /*
+         * Remove o perfil e a sessão persistente do usuário.
+         * A conta do Firebase Authentication é excluída depois que o banco
+         * estiver limpo, permitindo repetir a operação em caso de falha rara
+         * do Auth sem deixar dados pessoais para trás.
+         */
+        updates[`users/${uid}`] = null;
+        updates[`sessions/${uid}`] = null;
+
+        /*
+         * Libera qualquer nome de usuário que ainda esteja apontando para
+         * este UID. A varredura também corrige registros antigos/inconsistentes.
+         */
+        for (
+            const [usernameKeyValue, mappedUid]
+            of Object.entries(allUsernames)
+        ) {
+            if (String(mappedUid || "") === uid) {
+                updates[`usernames/${usernameKeyValue}`] = null;
+                updates[`usernameReservations/${usernameKeyValue}`] = null;
+            }
+        }
+
+        const profileUsernameKey =
+            String(profile.usernameKey || "").trim();
+
+        if (profileUsernameKey) {
+            const mapped =
+                allUsernames[profileUsernameKey];
+
+            if (
+                mapped == null ||
+                String(mapped) === uid
+            ) {
+                updates[`usernames/${profileUsernameKey}`] = null;
+                updates[`usernameReservations/${profileUsernameKey}`] = null;
+            }
+        }
+
+        /*
+         * 1) Canais criados pela conta são excluídos por completo.
+         * 2) Nos demais canais, remove qualquer função/estado pertencente
+         *    ao usuário (Moderador, legado Admin, Confiável ou Bloqueado).
+         * 3) Metadados "...By" que apontavam para o usuário são anonimizados
+         *    para não manter o UID apagado em ações de outras pessoas.
+         */
+        for (
+            const [channelId, channelValue]
+            of Object.entries(allChannels)
+        ) {
+            const channel = channelValue || {};
+
+            if (String(channel.ownerUid || "") === uid) {
+                const normalizedChannelId = String(channelId);
+                ownedChannelIds.add(normalizedChannelId);
+                ownedChannelsById.set(normalizedChannelId, channel);
+                updates[`channels/${channelId}`] = null;
+                updates[`publicChannels/${channelId}`] = null;
+                continue;
+            }
+
+            updates[`channels/${channelId}/moderators/${uid}`] = null;
+            updates[`channels/${channelId}/admins/${uid}`] = null;
+            updates[`channels/${channelId}/trustedUsers/${uid}`] = null;
+            updates[`channels/${channelId}/blockedUsers/${uid}`] = null;
+
+            const moderators = channel.moderators || {};
+            for (
+                const [targetUid, infoValue]
+                of Object.entries(moderators)
+            ) {
+                const info = infoValue || {};
+                if (String(info.addedBy || "") === uid) {
+                    updates[
+                        `channels/${channelId}/moderators/${targetUid}/addedBy`
+                    ] = null;
+                }
+            }
+
+            const trustedUsers = channel.trustedUsers || {};
+            for (
+                const [targetUid, infoValue]
+                of Object.entries(trustedUsers)
+            ) {
+                const info = infoValue || {};
+                if (String(info.trustedBy || "") === uid) {
+                    updates[
+                        `channels/${channelId}/trustedUsers/${targetUid}/trustedBy`
+                    ] = null;
+                }
+            }
+
+            const blockedUsers = channel.blockedUsers || {};
+            for (
+                const [targetUid, infoValue]
+                of Object.entries(blockedUsers)
+            ) {
+                const info = infoValue || {};
+                if (String(info.blockedBy || "") === uid) {
+                    updates[
+                        `channels/${channelId}/blockedUsers/${targetUid}/blockedBy`
+                    ] = null;
+                }
+            }
+        }
+
+        /*
+         * Se a conta era dona de canais, eles precisam desaparecer também
+         * das listas e do canal padrão de todos os participantes.
+         */
+        if (ownedChannelIds.size > 0) {
+            for (
+                const [otherUid, profileValue]
+                of Object.entries(allUsers)
+            ) {
+                /* O perfil desta conta já é removido pela raiz users/{uid}. */
+                if (String(otherUid) === uid) {
+                    continue;
+                }
+
+                const otherProfile = profileValue || {};
+                const memberships = otherProfile.channels || {};
+
+                for (const channelId of ownedChannelIds) {
+                    if (
+                        Object.prototype.hasOwnProperty.call(
+                            memberships,
+                            channelId
+                        )
+                    ) {
+                        const removedChannel =
+                            ownedChannelsById.get(channelId) || {};
+
+                        updates[
+                            `users/${otherUid}/channels/${channelId}`
+                        ] = buildRemovedChannelMembership(
+                            memberships[channelId],
+                            removedChannel,
+                            "owner_account_deleted",
+                            now
+                        );
+
+                        const normalizedOtherUid = String(otherUid);
+                        affectedUids.add(normalizedOtherUid);
+
+                        if (!removedChannelsByUid.has(normalizedOtherUid)) {
+                            removedChannelsByUid.set(
+                                normalizedOtherUid,
+                                []
+                            );
+                        }
+
+                        removedChannelsByUid
+                            .get(normalizedOtherUid)
+                            .push({
+                                channelId,
+                                channel: removedChannel,
+                                reason: "owner_account_deleted"
+                            });
+                    }
+
+                    if (
+                        String(otherProfile.defaultChannelId || "") ===
+                        channelId
+                    ) {
+                        updates[
+                            `users/${otherUid}/defaultChannelId`
+                        ] = null;
+
+                        if (String(otherUid) !== uid) {
+                            affectedUids.add(String(otherUid));
+                        }
+                    }
+                }
+            }
+        }
+
+        /*
+         * Encerra primeiro qualquer TX do usuário que está apagando a conta.
+         */
+        resetTransmitterIf(
+            uid,
+            null,
+            "account_deleted"
+        );
+
+        /*
+         * Um canal pertencente à conta pode estar sendo usado por outra pessoa.
+         * Como o canal será excluído, encerramos esse TX antes do update.
+         */
+        for (const channelId of ownedChannelIds) {
+            const activeState =
+                activeTransmitters.get(channelId);
+
+            if (!activeState) {
+                continue;
+            }
+
+            activeTransmitters.delete(channelId);
+
+            const txClient =
+                clients.get(
+                    String(activeState.userId || "")
+                );
+
+            if (
+                txClient &&
+                txClient.txChannelId === channelId
+            ) {
+                txClient.txChannelId = null;
+            }
+
+            broadcastJsonToChannel(
+                channelId,
+                {
+                    type: "stop_tx",
+                    from: activeState.userId,
+                    channelId
+                }
+            );
+        }
+
+        await db.ref().update(updates);
+
+        /*
+         * Avisa em tempo real quem estava com um canal do proprietário aberto.
+         * Depois sincroniza o estado: o canal permanece na lista como desligado
+         * e marcado como removido, até o próprio participante removê-lo.
+         */
+        for (const affectedUid of affectedUids) {
+            const removedEntries =
+                removedChannelsByUid.get(affectedUid) || [];
+
+            for (const entry of removedEntries) {
+                sendChannelRemovedEvent(
+                    affectedUid,
+                    entry.channelId,
+                    entry.channel,
+                    entry.reason
+                );
+            }
+
+            await refreshConnectedClientChannels(
+                affectedUid
+            );
+        }
+
+        /*
+         * Apaga finalmente a identidade do Firebase Authentication.
+         * user-not-found é tratado como sucesso para manter o endpoint idempotente.
+         */
+        try {
+            await auth.deleteUser(uid);
+        } catch (error) {
+            if (error?.code !== "auth/user-not-found") {
+                throw error;
+            }
+        }
+
+        /*
+         * Remove estado efêmero da Assistente que contenha a conta/canais
+         * apagados. Não é persistente, mas evita referências até o próximo restart.
+         */
+        for (const key of Array.from(assistantWarningCooldowns.keys())) {
+            const parts = String(key).split(":");
+            const keyChannelId = parts[0] || "";
+            const keyTargetUid = parts.slice(2).join(":");
+
+            if (
+                keyTargetUid === uid ||
+                ownedChannelIds.has(keyChannelId)
+            ) {
+                assistantWarningCooldowns.delete(key);
+            }
+        }
+
+        const ws = clients.get(uid);
+
+        if (ws && isOpen(ws)) {
+            sendJson(ws, {
+                type: "account_deleted",
+                message: "Conta excluída com sucesso."
+            });
+
+            /*
+             * Remove a presença imediatamente. O evento close que chegar depois
+             * será ignorado por removeClientPresence porque este socket já não é
+             * mais a conexão corrente registrada em clients.
+             */
+            removeClientPresence(
+                ws,
+                "account_deleted",
+                false
+            );
+
+            try {
+                ws.close(
+                    1000,
+                    "account_deleted"
+                );
+            } catch (_) {
+                try {
+                    ws.terminate();
+                } catch (_) {
+                }
+            }
+        }
+
+        broadcastUserLists();
+
+        console.log(
+            `[ACCOUNT DELETE] uid=${uid} ` +
+            `ownedChannels=${ownedChannelIds.size}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            message: "Conta excluída com sucesso"
+        });
+
+    } catch (error) {
+        console.error(
+            "[ACCOUNT DELETE]",
+            error?.stack || error?.message || error
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error:
+                "Não foi possível concluir a exclusão da conta. " +
+                "Tente novamente."
+        });
+    }
+}
+
 async function handleGetUserMe(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -1536,6 +2053,11 @@ async function handleDeleteChannel(req, res) {
         const affectedUids =
             new Set();
 
+        const removedParticipantUids =
+            new Set();
+
+        const removedAt = Date.now();
+
         for (
             const [
                 uid,
@@ -1559,9 +2081,27 @@ async function handleDeleteChannel(req, res) {
                     channelId
                 )
             ) {
-                updates[
-                    `users/${uid}/channels/${channelId}`
-                ] = null;
+                if (String(uid) === String(decoded.uid)) {
+                    /*
+                     * Para o próprio proprietário que excluiu manualmente o
+                     * canal, ele sai da lista. Os demais participantes mantêm
+                     * um registro desligado para saber que o canal foi removido.
+                     */
+                    updates[
+                        `users/${uid}/channels/${channelId}`
+                    ] = null;
+                } else {
+                    updates[
+                        `users/${uid}/channels/${channelId}`
+                    ] = buildRemovedChannelMembership(
+                        memberships[channelId],
+                        channel,
+                        "owner_deleted",
+                        removedAt
+                    );
+
+                    removedParticipantUids.add(String(uid));
+                }
 
                 affectedUids.add(
                     uid
@@ -1595,14 +2135,23 @@ async function handleDeleteChannel(req, res) {
             );
 
         /*
-         * Sincroniza imediatamente os WebSockets dos usuários
-         * afetados. Assim o canal desaparece sem precisar reiniciar
-         * o aplicativo ou desligar o Wi-Fi.
+         * Participantes recebem um aviso em tempo real e voltam para a lista.
+         * O canal permanece na lista deles como desligado/removido. Para o
+         * proprietário que executou a exclusão manual, o canal some da lista.
          */
         for (
             const uid
             of affectedUids
         ) {
+            if (removedParticipantUids.has(String(uid))) {
+                sendChannelRemovedEvent(
+                    uid,
+                    channelId,
+                    channel,
+                    "owner_deleted"
+                );
+            }
+
             await refreshConnectedClientChannels(
                 uid
             );
@@ -1676,11 +2225,59 @@ async function handleRemoveChannel(req, res) {
     }
 
     try {
+        const membershipRef = db.ref(
+            `users/${decoded.uid}/channels/${channelId}`
+        );
+
+        const membershipSnapshot = await membershipRef.get();
+
+        if (!membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não está na sua lista"
+            });
+            return;
+        }
+
+        const membership = membershipSnapshot.val() || {};
+
         const channelSnapshot = await db
             .ref(`channels/${channelId}`)
             .get();
 
         if (!channelSnapshot.exists()) {
+            /*
+             * Registro residual de um canal já removido pelo proprietário.
+             * Aqui o participante pode apenas limpar esse item da própria lista.
+             */
+            if (membership.removed === true) {
+                const profileSnapshot = await db
+                    .ref(`users/${decoded.uid}`)
+                    .get();
+
+                const profile = profileSnapshot.exists()
+                    ? profileSnapshot.val() || {}
+                    : {};
+
+                const updates = {
+                    [`users/${decoded.uid}/channels/${channelId}`]: null
+                };
+
+                if (String(profile.defaultChannelId || "") === channelId) {
+                    updates[`users/${decoded.uid}/defaultChannelId`] = null;
+                }
+
+                await db.ref().update(updates);
+                await refreshConnectedClientChannels(decoded.uid);
+
+                sendHttpJson(res, 200, {
+                    success: true,
+                    channelId,
+                    removedRecord: true
+                });
+                return;
+            }
+
             sendHttpJson(res, 404, {
                 success: false,
                 error: "Canal não encontrado"
@@ -1696,19 +2293,6 @@ async function handleRemoveChannel(req, res) {
             sendHttpJson(res, 403, {
                 success: false,
                 error: "O criador do canal deve usar a opção Excluir canal"
-            });
-            return;
-        }
-
-        const membershipRef = db.ref(
-            `users/${decoded.uid}/channels/${channelId}`
-        );
-        const membershipSnapshot = await membershipRef.get();
-
-        if (!membershipSnapshot.exists()) {
-            sendHttpJson(res, 404, {
-                success: false,
-                error: "Canal não está na sua lista"
             });
             return;
         }
@@ -5090,6 +5674,25 @@ const httpServer =
             ) {
 
                 await handleReleaseUsername(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // USER ACCOUNT DELETE
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/users/delete-account"
+            ) {
+
+                await handleDeleteOwnAccount(
                     req,
                     res
                 );
