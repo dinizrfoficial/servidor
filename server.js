@@ -1605,6 +1605,31 @@ async function handleGetUserMe(req, res) {
 
     try {
         const profile = await getUserProfile(decoded.uid);
+
+        const assistantProfile =
+            profile.assistantProfile &&
+            typeof profile.assistantProfile === "object"
+                ? profile.assistantProfile
+                : null;
+
+        const assistantProfileConfigured =
+            assistantProfile !== null;
+
+        const assistantName =
+            String(
+                assistantProfile?.name ||
+                "Z-Link"
+            )
+                .trim()
+                .slice(0, 32) ||
+            "Z-Link";
+
+        const assistantAvatar =
+            sanitizeAvatar(
+                assistantProfile?.avatar ||
+                ""
+            );
+
         sendHttpJson(res, 200, {
             success: true,
             uid: decoded.uid,
@@ -1615,7 +1640,10 @@ async function handleGetUserMe(req, res) {
                 profile.photoUrl ||
                 decoded.picture ||
                 ""
-            )
+            ),
+            assistantProfileConfigured,
+            assistantName,
+            assistantAvatar
         });
     } catch (error) {
         console.error("[USER ME]", error.message);
@@ -1799,6 +1827,104 @@ async function handleSetUserAvatar(req, res) {
 // ============================================================
 // ALTERAR NOME DO PRÓPRIO USUÁRIO
 // ============================================================
+
+async function handleSetAssistantProfile(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const assistantName =
+        String(
+            body.assistantName ||
+            "Z-Link"
+        )
+            .trim()
+            .slice(0, 32) ||
+        "Z-Link";
+
+    const rawAvatar =
+        String(
+            body.assistantAvatar ||
+            ""
+        ).trim();
+
+    const assistantAvatar =
+        sanitizeAvatar(rawAvatar);
+
+    if (rawAvatar && !assistantAvatar) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Imagem da Assistente inválida ou muito grande"
+        });
+        return;
+    }
+
+    try {
+        await db
+            .ref(`users/${decoded.uid}/assistantProfile`)
+            .set({
+                name: assistantName,
+                avatar: assistantAvatar || "",
+                updatedAt: Date.now()
+            });
+
+        /*
+         * Mantém a sessão WebSocket atual coerente com o perfil persistido.
+         * O cliente também reaplica assistant_focus, então esta atualização
+         * é apenas uma proteção adicional.
+         */
+        const ws = clients.get(decoded.uid);
+        if (ws && isOpen(ws)) {
+            ws.assistantProfileName =
+                assistantName;
+
+            ws.assistantProfileAvatar =
+                assistantAvatar || "";
+        }
+
+        sendHttpJson(res, 200, {
+            success: true,
+            assistantName,
+            assistantAvatar: assistantAvatar || ""
+        });
+    } catch (error) {
+        console.error(
+            "[ASSISTANT PROFILE]",
+            error?.stack || error?.message || error
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível salvar o perfil da Assistente"
+        });
+    }
+}
 
 async function handleSetOwnUsername(req, res) {
     if (!firebaseReady || !db || !auth) {
@@ -6062,6 +6188,21 @@ const httpServer =
             ) {
 
                 await handleSetUserAvatar(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/users/assistant-profile"
+            ) {
+
+                await handleSetAssistantProfile(
                     req,
                     res
                 );
