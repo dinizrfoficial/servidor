@@ -7760,7 +7760,8 @@ function resetTransmitterIf(
 const ASSISTANT_WARNING_CODES = new Set([
     "long_exchange",
     "repetitive_ptt",
-    "exchange_gap"
+    "exchange_gap",
+    "periodic_message"
 ]);
 
 const assistantWarningCooldowns = new Map();
