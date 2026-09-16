@@ -714,6 +714,19 @@ async function refreshConnectedClientChannels(uid) {
             }
         }
 
+        if (ws.lastMessageReplayChannelId) {
+            if (
+                !ws.enabledChannelIds.has(ws.lastMessageReplayChannelId) ||
+                String(ws.activeChannelId || "") !==
+                    String(ws.lastMessageReplayChannelId)
+            ) {
+                applyLastMessageReplayFocus(
+                    ws,
+                    null
+                );
+            }
+        }
+
         /*
          * O canal atual pode ter prioridade sobre o padrão.
          * Só encerra o TX se o canal realmente deixou de estar habilitado.
@@ -7227,10 +7240,17 @@ function receiveCandidatesForClient(ws) {
     const assistantExclusiveChannelId =
         String(ws.assistantExclusiveChannelId || "");
 
+    const lastMessageReplayChannelId =
+        String(ws.lastMessageReplayChannelId || "");
+
+    const exclusiveReceiveChannelId =
+        assistantExclusiveChannelId ||
+        lastMessageReplayChannelId;
+
     for (const [channelId, state] of activeTransmitters) {
         if (
-            assistantExclusiveChannelId &&
-            String(channelId) !== assistantExclusiveChannelId
+            exclusiveReceiveChannelId &&
+            String(channelId) !== exclusiveReceiveChannelId
         ) {
             continue;
         }
@@ -7452,6 +7472,54 @@ function applyAssistantExclusiveFocus(
     sendJson(
         ws,
         buildChannelStateMessage(ws)
+    );
+}
+
+function applyLastMessageReplayFocus(
+    ws,
+    channelId
+) {
+    const normalized =
+        channelId
+            ? String(channelId).trim()
+            : "";
+
+    const nextChannelId =
+        normalized || null;
+
+    if (
+        String(ws.lastMessageReplayChannelId || "") ===
+        String(nextChannelId || "")
+    ) {
+        return;
+    }
+
+    const previousRx =
+        ws.rxChannelId || null;
+
+    ws.lastMessageReplayChannelId =
+        nextChannelId;
+
+    clearReceiveSelectionTimer(ws);
+
+    if (previousRx) {
+        const previousState =
+            activeTransmitters.get(previousRx);
+
+        sendJson(ws, {
+            type: "stop_tx",
+            from: previousState?.userId || "",
+            channelId: previousRx,
+            suppressRoger: true,
+            reason: "last_message_replay_focus"
+        });
+
+        ws.rxChannelId = null;
+    }
+
+    ensureReceiveSelectionNow(
+        ws,
+        false
     );
 }
 
@@ -8127,6 +8195,7 @@ async function handleJson(
              */
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
+            ws.lastMessageReplayChannelId = null;
 
         } catch (error) {
             console.error(
@@ -8140,6 +8209,7 @@ async function handleJson(
             ws.activeChannelId = null;
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
+            ws.lastMessageReplayChannelId = null;
         }
 
         ws.txChannelId =
@@ -8292,6 +8362,61 @@ async function handleJson(
         console.log(
             `[NAME IGNORED] ${ws.userId} tentou alterar o nome público`
         );
+
+        return;
+    }
+
+    // ========================================================
+    // ÚLTIMA MENSAGEM - FOCO TEMPORÁRIO NO CANAL ABERTO
+    // ========================================================
+
+    if (
+        data.type ===
+        "last_message_replay_focus"
+    ) {
+        const enabled =
+            data.enabled === true;
+
+        const requestedChannelId =
+            String(data.channelId || "").trim();
+
+        if (!enabled) {
+            applyLastMessageReplayFocus(
+                ws,
+                null
+            );
+            return;
+        }
+
+        const allowed =
+            !!requestedChannelId &&
+            ws.enabledChannelIds?.has(requestedChannelId) &&
+            String(ws.activeChannelId || "") ===
+                requestedChannelId;
+
+        if (!allowed) {
+            applyLastMessageReplayFocus(
+                ws,
+                null
+            );
+
+            sendJson(ws, {
+                type: "last_message_replay_focus_denied",
+                channelId: requestedChannelId || null,
+                message: "A reprodução da última mensagem só pode focar o canal atualmente aberto."
+            });
+            return;
+        }
+
+        applyLastMessageReplayFocus(
+            ws,
+            requestedChannelId
+        );
+
+        sendJson(ws, {
+            type: "last_message_replay_focus_applied",
+            channelId: requestedChannelId
+        });
 
         return;
     }
@@ -8467,6 +8592,17 @@ async function handleJson(
                 requestedChannelId
         ) {
             applyAssistantExclusiveFocus(
+                ws,
+                null
+            );
+        }
+
+        if (
+            ws.lastMessageReplayChannelId &&
+            String(ws.lastMessageReplayChannelId) !==
+                requestedChannelId
+        ) {
+            applyLastMessageReplayFocus(
                 ws,
                 null
             );
@@ -9169,6 +9305,9 @@ wss.on(
             null;
 
         ws.assistantExclusiveChannelId =
+            null;
+
+        ws.lastMessageReplayChannelId =
             null;
 
         ws.txChannelId =
