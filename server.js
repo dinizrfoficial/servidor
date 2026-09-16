@@ -246,19 +246,6 @@ const ALLOWED_INTERRUPTION_SECONDS =
         60
     ]);
 
-/*
- * Controle de chamadas telefônicas por canal administrado.
- * O servidor apenas persiste/distribui a política; a aplicação Android
- * aplica a integração com Telecom/Telephony no canal atualmente aberto.
- */
-const DEFAULT_CALL_CONTROL_MODE = "disabled";
-const ALLOWED_CALL_CONTROL_MODES =
-    new Set([
-        "disabled",
-        "block",
-        "accept"
-    ]);
-
 // ============================================================
 // CANAIS
 // ============================================================
@@ -472,66 +459,6 @@ function updateInMemoryChannelInterruptionTimes(
 
                     interruptionTimes:
                         normalized
-                }
-            );
-        }
-    }
-}
-
-function normalizeCallControlMode(value) {
-    const mode =
-        String(value || "")
-            .trim()
-            .toLowerCase();
-
-    return ALLOWED_CALL_CONTROL_MODES.has(mode)
-        ? mode
-        : DEFAULT_CALL_CONTROL_MODE;
-}
-
-function getChannelCallControlMode(channel) {
-    return normalizeCallControlMode(
-        channel?.callControlMode
-    );
-}
-
-function updateInMemoryChannelCallControlMode(
-    channelId,
-    mode
-) {
-    const normalizedChannelId =
-        String(channelId || "");
-
-    const normalizedMode =
-        normalizeCallControlMode(mode);
-
-    for (const client of clients.values()) {
-        const item =
-            Array.isArray(client.channels)
-                ? client.channels.find(
-                    entry =>
-                        String(entry?.id || "") ===
-                            normalizedChannelId
-                )
-                : null;
-
-        if (item) {
-            item.callControlMode =
-                normalizedMode;
-        }
-
-        if (item && isOpen(client)) {
-            sendJson(
-                client,
-                {
-                    type:
-                        "call_control_settings_changed",
-
-                    channelId:
-                        normalizedChannelId,
-
-                    mode:
-                        normalizedMode
                 }
             );
         }
@@ -773,11 +700,6 @@ async function getUserChannels(uid) {
 
             interruptionTimes:
                 getChannelInterruptionTimes(
-                    channel
-                ),
-
-            callControlMode:
-                getChannelCallControlMode(
                     channel
                 ),
 
@@ -1049,7 +971,6 @@ async function handleCreateChannel(req, res) {
             type,
             ownerUid: decoded.uid,
             avatar,
-            callControlMode: DEFAULT_CALL_CONTROL_MODE,
             createdAt: now,
             updatedAt: now
         };
@@ -1098,7 +1019,6 @@ async function handleCreateChannel(req, res) {
                 type,
                 ownerUid: decoded.uid,
                 avatar,
-                callControlMode: DEFAULT_CALL_CONTROL_MODE,
                 enabled: true,
                 isDefault: !userProfile.defaultChannelId
             }
@@ -3592,170 +3512,6 @@ async function handleSetChannelInterruptionSettings(
         sendHttpJson(res, 500, {
             success: false,
             error: "Não foi possível salvar o tempo de interrupção"
-        });
-    }
-}
-
-async function handleGetChannelCallControlSettings(
-    req,
-    res
-) {
-    if (!firebaseReady || !db || !auth) {
-        sendHttpJson(res, 503, {
-            success: false,
-            error: "Serviço temporariamente indisponível"
-        });
-        return;
-    }
-
-    let decoded;
-
-    try {
-        decoded = await verifyBearerToken(req);
-    } catch (_) {
-        sendHttpJson(res, 401, {
-            success: false,
-            error: "Sessão inválida ou expirada"
-        });
-        return;
-    }
-
-    const url =
-        new URL(
-            req.url,
-            `http://${req.headers.host || "localhost"}`
-        );
-
-    const channelId =
-        String(
-            url.searchParams.get("channelId") || ""
-        ).trim();
-
-    try {
-        const channel =
-            await getOwnedChannelOrRespond(
-                res,
-                decoded.uid,
-                channelId
-            );
-
-        if (!channel) {
-            return;
-        }
-
-        sendHttpJson(res, 200, {
-            success: true,
-            channelId,
-            mode: getChannelCallControlMode(channel)
-        });
-    } catch (error) {
-        console.error(
-            "[CALL CONTROL GET]",
-            error.message
-        );
-
-        sendHttpJson(res, 500, {
-            success: false,
-            error: "Não foi possível carregar o controle de chamadas"
-        });
-    }
-}
-
-async function handleSetChannelCallControlSettings(
-    req,
-    res
-) {
-    if (!firebaseReady || !db || !auth) {
-        sendHttpJson(res, 503, {
-            success: false,
-            error: "Serviço temporariamente indisponível"
-        });
-        return;
-    }
-
-    let decoded;
-
-    try {
-        decoded = await verifyBearerToken(req);
-    } catch (_) {
-        sendHttpJson(res, 401, {
-            success: false,
-            error: "Sessão inválida ou expirada"
-        });
-        return;
-    }
-
-    let body;
-
-    try {
-        body = await readJsonBody(req);
-    } catch (error) {
-        sendHttpJson(res, 400, {
-            success: false,
-            error: error.message
-        });
-        return;
-    }
-
-    const channelId =
-        String(body.channelId || "")
-            .trim();
-
-    const mode =
-        String(body.mode || "")
-            .trim()
-            .toLowerCase();
-
-    if (!ALLOWED_CALL_CONTROL_MODES.has(mode)) {
-        sendHttpJson(res, 400, {
-            success: false,
-            error: "Modo de controle de chamadas inválido"
-        });
-        return;
-    }
-
-    try {
-        const channel =
-            await getOwnedChannelOrRespond(
-                res,
-                decoded.uid,
-                channelId
-            );
-
-        if (!channel) {
-            return;
-        }
-
-        await db
-            .ref(
-                `channels/${channelId}/callControlMode`
-            )
-            .set(mode);
-
-        updateInMemoryChannelCallControlMode(
-            channelId,
-            mode
-        );
-
-        console.log(
-            `[CALL CONTROL] owner=${decoded.uid} ` +
-            `channel=${channelId} mode=${mode}`
-        );
-
-        sendHttpJson(res, 200, {
-            success: true,
-            channelId,
-            mode
-        });
-    } catch (error) {
-        console.error(
-            "[CALL CONTROL SET]",
-            error.message
-        );
-
-        sendHttpJson(res, 500, {
-            success: false,
-            error: "Não foi possível salvar o controle de chamadas"
         });
     }
 }
@@ -7259,34 +7015,6 @@ const httpServer =
                     "/api/channels/interruption-settings"
             ) {
                 await handleSetChannelInterruptionSettings(
-                    req,
-                    res
-                );
-                return;
-            }
-
-            // ------------------------------------------------
-            // CHANNEL ADMIN - CONTROLE DE CHAMADAS
-            // ------------------------------------------------
-
-            if (
-                req.method === "GET" &&
-                req.url.split("?")[0] ===
-                    "/api/channels/call-control-settings"
-            ) {
-                await handleGetChannelCallControlSettings(
-                    req,
-                    res
-                );
-                return;
-            }
-
-            if (
-                req.method === "POST" &&
-                req.url ===
-                    "/api/channels/call-control-settings"
-            ) {
-                await handleSetChannelCallControlSettings(
                     req,
                     res
                 );
