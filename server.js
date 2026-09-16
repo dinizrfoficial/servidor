@@ -2393,6 +2393,239 @@ async function handleSetOwnUsername(req, res) {
     }
 }
 
+async function handleUpdateChannelProfile(req, res) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+    try {
+        decoded = await verifyBearerToken(req);
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId =
+        String(body.channelId || "").trim();
+
+    const hasName =
+        Object.prototype.hasOwnProperty.call(
+            body,
+            "name"
+        );
+
+    const hasDescription =
+        Object.prototype.hasOwnProperty.call(
+            body,
+            "description"
+        );
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "ID de canal inválido"
+        });
+        return;
+    }
+
+    if (!hasName && !hasDescription) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Nenhuma alteração foi informada"
+        });
+        return;
+    }
+
+    const requestedName =
+        hasName
+            ? String(body.name || "").trim()
+            : null;
+
+    if (requestedName !== null) {
+        /*
+         * Regra única: o nome do canal reutiliza exatamente o mesmo
+         * validador do nome de usuário. Assim, qualquer alteração futura
+         * nas regras de nome permanece coerente nos dois fluxos.
+         */
+        const validation =
+            validateUsername(
+                requestedName
+            );
+
+        if (validation) {
+            sendHttpJson(res, 400, {
+                success: false,
+                code: "CHANNEL_NAME_INVALID",
+                error: String(validation)
+                    .replace(
+                        /nome de usuário/gi,
+                        "nome do canal"
+                    )
+            });
+            return;
+        }
+    }
+
+    const requestedDescription =
+        hasDescription
+            ? sanitizeChannelDescription(
+                body.description
+            )
+            : null;
+
+    try {
+        const channelRef =
+            db.ref(
+                `channels/${channelId}`
+            );
+
+        const snapshot =
+            await channelRef.get();
+
+        if (!snapshot.exists()) {
+            sendHttpJson(res, 404, {
+                success: false,
+                error: "Canal não encontrado"
+            });
+            return;
+        }
+
+        const channel =
+            snapshot.val() || {};
+
+        if (
+            String(channel.ownerUid || "") !==
+            String(decoded.uid || "")
+        ) {
+            sendHttpJson(res, 403, {
+                success: false,
+                error: "Somente o proprietário do canal pode alterar o nome ou a descrição"
+            });
+            return;
+        }
+
+        const updatedName =
+            requestedName !== null
+                ? requestedName
+                : String(channel.name || "Canal");
+
+        const updatedDescription =
+            requestedDescription !== null
+                ? requestedDescription
+                : String(channel.description || "");
+
+        const now = Date.now();
+        const updates = {};
+
+        if (requestedName !== null) {
+            updates[`channels/${channelId}/name`] =
+                updatedName;
+        }
+
+        if (requestedDescription !== null) {
+            updates[`channels/${channelId}/description`] =
+                updatedDescription;
+        }
+
+        updates[`channels/${channelId}/updatedAt`] =
+            now;
+
+        if ((channel.type || "public") === "public") {
+            if (requestedName !== null) {
+                updates[`publicChannels/${channelId}/name`] =
+                    updatedName;
+            }
+
+            if (requestedDescription !== null) {
+                updates[`publicChannels/${channelId}/description`] =
+                    updatedDescription;
+            }
+        }
+
+        await db.ref().update(updates);
+
+        /*
+         * Atualiza imediatamente o cache de todos os participantes que já
+         * estão conectados e em seguida envia um evento específico para as
+         * telas, além do channel_state completo para manter o serviço coerente.
+         */
+        for (const ws of clients.values()) {
+            const item =
+                (ws.channels || [])
+                    .find(
+                        entry =>
+                            String(entry?.id || "") ===
+                            channelId
+                    );
+
+            if (!item) {
+                continue;
+            }
+
+            item.name = updatedName;
+            item.description = updatedDescription;
+
+            if (isOpen(ws)) {
+                sendJson(ws, {
+                    type: "channel_profile_updated",
+                    channelId,
+                    name: updatedName,
+                    description: updatedDescription
+                });
+
+                sendJson(
+                    ws,
+                    buildChannelStateMessage(ws)
+                );
+            }
+        }
+
+        console.log(
+            `[CHANNEL PROFILE] uid=${decoded.uid} channel=${channelId} ` +
+            `nameChanged=${requestedName !== null} ` +
+            `descriptionChanged=${requestedDescription !== null}`
+        );
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channel: {
+                id: channelId,
+                name: updatedName,
+                description: updatedDescription
+            }
+        });
+    } catch (error) {
+        console.error(
+            "[CHANNEL PROFILE]",
+            error?.stack || error?.message || error
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível atualizar o canal"
+        });
+    }
+}
+
 async function handleSetChannelAvatar(req, res) {
     if (!firebaseReady || !db || !auth) {
         sendHttpJson(res, 503, {
@@ -6677,6 +6910,25 @@ const httpServer =
             ) {
 
                 await handleAddChannel(
+                    req,
+                    res
+                );
+
+                return;
+            }
+
+            // ------------------------------------------------
+            // CHANNEL PROFILE (NOME / DESCRIÇÃO)
+            // ------------------------------------------------
+
+            if (
+                req.method ===
+                    "POST" &&
+                req.url ===
+                    "/api/channels/profile"
+            ) {
+
+                await handleUpdateChannelProfile(
                     req,
                     res
                 );
