@@ -225,8 +225,26 @@ const LATE_JOIN_BOOTSTRAP_PACKETS =
  */
 const RX_SIMULTANEOUS_WINDOW_MS = 60;
 
-const TX_PREEMPT_NORMAL_MS = 60_000;
-const TX_PREEMPT_PRIVILEGED_MS = 5_000;
+/*
+ * Tempo de interrupção por categoria.
+ *
+ * Desde a v114 o valor é configurado individualmente por canal pelo
+ * Administrador/criador. Canais antigos que ainda não possuem o campo
+ * persistido começam em 0s, conforme a nova regra.
+ */
+const DEFAULT_INTERRUPTION_SECONDS = 0;
+const ALLOWED_INTERRUPTION_SECONDS =
+    new Set([
+        0,
+        1,
+        5,
+        10,
+        20,
+        30,
+        40,
+        50,
+        60
+    ]);
 
 // ============================================================
 // CANAIS
@@ -344,6 +362,107 @@ function getChannelAdminUids(channel) {
      * A partir desta versão estes UIDs representam MODERADORES.
      */
     return getChannelModeratorUids(channel);
+}
+
+function normalizeInterruptionSeconds(value) {
+    const seconds =
+        Number(value);
+
+    return (
+        Number.isInteger(seconds) &&
+        ALLOWED_INTERRUPTION_SECONDS.has(seconds)
+    )
+        ? seconds
+        : DEFAULT_INTERRUPTION_SECONDS;
+}
+
+function getChannelInterruptionTimes(channel) {
+    const raw =
+        (
+            channel &&
+            typeof channel.interruptionTimes === "object" &&
+            channel.interruptionTimes
+        )
+            ? channel.interruptionTimes
+            : {};
+
+    return {
+        administratorSeconds:
+            normalizeInterruptionSeconds(
+                raw.administratorSeconds
+            ),
+
+        moderatorSeconds:
+            normalizeInterruptionSeconds(
+                raw.moderatorSeconds
+            ),
+
+        userSeconds:
+            normalizeInterruptionSeconds(
+                raw.userSeconds
+            )
+    };
+}
+
+function updateInMemoryChannelInterruptionTimes(
+    channelId,
+    interruptionTimes
+) {
+    const normalizedChannelId =
+        String(channelId || "");
+
+    const normalized =
+        {
+            administratorSeconds:
+                normalizeInterruptionSeconds(
+                    interruptionTimes?.administratorSeconds
+                ),
+
+            moderatorSeconds:
+                normalizeInterruptionSeconds(
+                    interruptionTimes?.moderatorSeconds
+                ),
+
+            userSeconds:
+                normalizeInterruptionSeconds(
+                    interruptionTimes?.userSeconds
+                )
+        };
+
+    for (const client of clients.values()) {
+        const item =
+            Array.isArray(client.channels)
+                ? client.channels.find(
+                    entry =>
+                        String(entry?.id || "") ===
+                            normalizedChannelId
+                )
+                : null;
+
+        if (item) {
+            item.interruptionTimes =
+                normalized;
+        }
+
+        if (
+            item &&
+            isOpen(client)
+        ) {
+            sendJson(
+                client,
+                {
+                    type:
+                        "interruption_settings_changed",
+
+                    channelId:
+                        normalizedChannelId,
+
+                    interruptionTimes:
+                        normalized
+                }
+            );
+        }
+    }
 }
 
 function isChannelOwnerUser(channel, uid) {
@@ -578,6 +697,11 @@ async function getUserChannels(uid) {
             type: channel.type || "public",
             ownerUid: channel.ownerUid || "",
             moderatorUids: getChannelModeratorUids(channel),
+
+            interruptionTimes:
+                getChannelInterruptionTimes(
+                    channel
+                ),
 
             // Compatibilidade com versões antigas do Android.
             adminUids: getChannelModeratorUids(channel),
@@ -2911,6 +3035,252 @@ async function getManagedChannelOrRespond(res, actorUid, channelId) {
     }
 
     return channel;
+}
+
+async function handleGetChannelInterruptionSettings(
+    req,
+    res
+) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+
+    try {
+        decoded =
+            await verifyBearerToken(
+                req
+            );
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    const url =
+        new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+        );
+
+    const channelId =
+        String(
+            url.searchParams.get(
+                "channelId"
+            ) || ""
+        )
+            .trim();
+
+    try {
+        const channel =
+            await getOwnedChannelOrRespond(
+                res,
+                decoded.uid,
+                channelId
+            );
+
+        if (!channel) {
+            return;
+        }
+
+        sendHttpJson(
+            res,
+            200,
+            {
+                success: true,
+                channelId,
+                interruptionTimes:
+                    getChannelInterruptionTimes(
+                        channel
+                    )
+            }
+        );
+    } catch (error) {
+        console.error(
+            "[INTERRUPTION SETTINGS GET]",
+            error.message
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar o tempo de interrupção"
+        });
+    }
+}
+
+async function handleSetChannelInterruptionSettings(
+    req,
+    res
+) {
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Serviço temporariamente indisponível"
+        });
+        return;
+    }
+
+    let decoded;
+
+    try {
+        decoded =
+            await verifyBearerToken(
+                req
+            );
+    } catch (_) {
+        sendHttpJson(res, 401, {
+            success: false,
+            error: "Sessão inválida ou expirada"
+        });
+        return;
+    }
+
+    let body;
+
+    try {
+        body =
+            await readJsonBody(
+                req
+            );
+    } catch (error) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: error.message
+        });
+        return;
+    }
+
+    const channelId =
+        String(
+            body.channelId || ""
+        )
+            .trim();
+
+    const category =
+        String(
+            body.category || ""
+        )
+            .trim()
+            .toLowerCase();
+
+    const seconds =
+        Number(
+            body.seconds
+        );
+
+    const fieldByCategory = {
+        administrator:
+            "administratorSeconds",
+
+        moderator:
+            "moderatorSeconds",
+
+        moderators:
+            "moderatorSeconds",
+
+        user:
+            "userSeconds",
+
+        users:
+            "userSeconds"
+    };
+
+    const field =
+        fieldByCategory[category];
+
+    if (!field) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Categoria inválida"
+        });
+        return;
+    }
+
+    if (
+        !Number.isInteger(seconds) ||
+        !ALLOWED_INTERRUPTION_SECONDS.has(
+            seconds
+        )
+    ) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Tempo de interrupção inválido"
+        });
+        return;
+    }
+
+    try {
+        const channel =
+            await getOwnedChannelOrRespond(
+                res,
+                decoded.uid,
+                channelId
+            );
+
+        if (!channel) {
+            return;
+        }
+
+        await db
+            .ref(
+                `channels/${channelId}/interruptionTimes/${field}`
+            )
+            .set(
+                seconds
+            );
+
+        const interruptionTimes =
+            getChannelInterruptionTimes(
+                {
+                    ...channel,
+                    interruptionTimes: {
+                        ...(
+                            channel.interruptionTimes ||
+                            {}
+                        ),
+                        [field]:
+                            seconds
+                    }
+                }
+            );
+
+        updateInMemoryChannelInterruptionTimes(
+            channelId,
+            interruptionTimes
+        );
+
+        console.log(
+            `[INTERRUPTION SETTINGS] owner=${decoded.uid} ` +
+            `channel=${channelId} category=${category} seconds=${seconds}`
+        );
+
+        sendHttpJson(
+            res,
+            200,
+            {
+                success: true,
+                channelId,
+                interruptionTimes
+            }
+        );
+    } catch (error) {
+        console.error(
+            "[INTERRUPTION SETTINGS SET]",
+            error.message
+        );
+
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível salvar o tempo de interrupção"
+        });
+    }
 }
 
 async function handleDisconnectChannelUser(req, res) {
@@ -6372,6 +6742,34 @@ const httpServer =
             }
 
             // ------------------------------------------------
+            // CHANNEL ADMIN - TEMPO DE INTERRUPÇÃO
+            // ------------------------------------------------
+
+            if (
+                req.method === "GET" &&
+                req.url.split("?")[0] ===
+                    "/api/channels/interruption-settings"
+            ) {
+                await handleGetChannelInterruptionSettings(
+                    req,
+                    res
+                );
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url ===
+                    "/api/channels/interruption-settings"
+            ) {
+                await handleSetChannelInterruptionSettings(
+                    req,
+                    res
+                );
+                return;
+            }
+
+            // ------------------------------------------------
             // CHANNEL ADMIN - CONNECTED / BLOCKED USERS
             // ------------------------------------------------
 
@@ -7187,7 +7585,7 @@ function txPreemptThresholdMs(
         !channel ||
         !uid
     ) {
-        return TX_PREEMPT_NORMAL_MS;
+        return 0;
     }
 
     const isOwner =
@@ -7218,12 +7616,21 @@ function txPreemptThresholdMs(
             uid
         );
 
-    return (
-        isOwner ||
-        isModerator
-    )
-        ? TX_PREEMPT_PRIVILEGED_MS
-        : TX_PREEMPT_NORMAL_MS;
+    const interruptionTimes =
+        getChannelInterruptionTimes(
+            channel
+        );
+
+    const seconds =
+        isOwner
+            ? interruptionTimes.administratorSeconds
+            : (
+                isModerator
+                    ? interruptionTimes.moderatorSeconds
+                    : interruptionTimes.userSeconds
+            );
+
+    return seconds * 1000;
 }
 
 function receiveCandidatesForClient(ws) {
