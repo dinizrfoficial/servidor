@@ -9588,6 +9588,163 @@ async function handleJson(
     }
 
     // ========================================================
+    // MODO ASSISTENTE - CÂMBIO ESPADA / INTERRUPÇÃO NO LIMITE
+    // ========================================================
+
+    if (
+        data.type ===
+        "assistant_long_exchange_interrupt"
+    ) {
+        const channelId =
+            String(data.channelId || "").trim();
+
+        const requestedTargetUserId =
+            String(data.targetUserId || "").trim();
+
+        const requestedTargetName =
+            String(data.targetName || "").slice(0, 64);
+
+        const requestedThresholdMs =
+            Number(data.thresholdMs);
+
+        const thresholdMs =
+            Number.isFinite(requestedThresholdMs)
+                ? Math.min(
+                    300_000,
+                    Math.max(
+                        60_000,
+                        requestedThresholdMs
+                    )
+                )
+                : 120_000;
+
+        const channel =
+            channelMetadataForClient(
+                ws,
+                channelId
+            );
+
+        if (
+            !channelId ||
+            !channel ||
+            !isChannelOwnerUser(channel, ws.userId) ||
+            String(ws.activeChannelId || "") !== channelId ||
+            !ws.enabledChannelIds?.has(channelId)
+        ) {
+            sendJson(ws, {
+                type: "assistant_long_exchange_interrupt_denied",
+                channelId,
+                targetUserId: requestedTargetUserId,
+                message: "Não foi possível interromper esta transmissão."
+            });
+            return;
+        }
+
+        const active =
+            activeTransmitters.get(channelId);
+
+        /*
+         * O Android agenda o pedido exatamente no limite configurado.
+         * Ainda assim, a autoridade final é o servidor: somente corta se
+         * aquele mesmo usuário continuar ocupando o canal neste instante.
+         */
+        if (
+            !active ||
+            active.assistantGenerated ||
+            (
+                requestedTargetUserId &&
+                String(active.userId || "") !== requestedTargetUserId
+            )
+        ) {
+            sendJson(ws, {
+                type: "assistant_long_exchange_interrupt_denied",
+                channelId,
+                targetUserId: requestedTargetUserId,
+                message: "A transmissão já terminou ou foi substituída."
+            });
+            return;
+        }
+
+        const activeDurationMs =
+            Math.max(
+                0,
+                Date.now() -
+                    Number(active.startedAt || Date.now())
+            );
+
+        if (activeDurationMs < thresholdMs) {
+            sendJson(ws, {
+                type: "assistant_long_exchange_interrupt_denied",
+                channelId,
+                targetUserId: requestedTargetUserId,
+                message: "O limite configurado ainda não foi atingido."
+            });
+            return;
+        }
+
+        const targetUserId =
+            String(active.userId || "");
+
+        const targetName =
+            String(
+                active.name ||
+                requestedTargetName ||
+                targetUserId
+            ).slice(0, 64);
+
+        const targetWs =
+            clients.get(targetUserId);
+
+        console.log(
+            `[ASSISTANT LONG EXCHANGE INTERRUPT] ` +
+            `owner=${ws.userId} channel=${channelId} ` +
+            `target=${targetUserId}`
+        );
+
+        /*
+         * Libera o PTT sem remover, bloquear ou desconectar o usuário.
+         * O motivo especial impede que o STOP forçado seja interpretado
+         * como uma segunda advertência de Câmbio Espada.
+         */
+        resetTransmitterIf(
+            targetUserId,
+            null,
+            "assistant_interrupted"
+        );
+
+        /*
+         * O aparelho que estava transmitindo precisa encerrar a captura
+         * local imediatamente, mesmo que o botão físico/tela ainda esteja
+         * pressionado. Reutilizamos o tratamento seguro de tx_denied.
+         */
+        if (
+            targetWs &&
+            isOpen(targetWs)
+        ) {
+            sendJson(targetWs, {
+                type: "tx_denied",
+                code: "LONG_EXCHANGE_INTERRUPTED",
+                channelId,
+                message: "Transmissão interrompida pela Assistente."
+            });
+        }
+
+        /*
+         * Somente após o canal estar livre autorizamos o ADM a colocar o
+         * alerta na fila. WebSocket preserva a ordem entre STOP e este ACK.
+         */
+        sendJson(ws, {
+            type: "assistant_long_exchange_interrupted",
+            channelId,
+            targetUserId,
+            targetName,
+            ts: Date.now()
+        });
+
+        return;
+    }
+
+    // ========================================================
     // MODO ASSISTENTE - ADVERTÊNCIA TRANSMITIDA COMO PTT REAL
     // ========================================================
 
