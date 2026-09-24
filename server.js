@@ -2523,6 +2523,63 @@ async function handleUpdateChannelProfile(req, res) {
             return;
         }
 
+        if (requestedName !== null) {
+            const currentName =
+                String(channel.name || "Canal");
+
+            const requestedKey =
+                normalizeUsername(requestedName);
+
+            const currentKey =
+                normalizeUsername(currentName);
+
+            /*
+             * Assim como na troca do nome de usuário, a comparação é
+             * case-insensitive. A mesma grafia com outra combinação de
+             * maiúsculas/minúsculas continua permitida para o próprio canal.
+             */
+            if (requestedKey !== currentKey) {
+                const channelsSnapshot =
+                    await db.ref("channels").get();
+
+                let nameAlreadyUsed = false;
+
+                channelsSnapshot.forEach(
+                    child => {
+                        if (
+                            String(child.key || "") ===
+                            channelId
+                        ) {
+                            return false;
+                        }
+
+                        const otherChannel =
+                            child.val() || {};
+
+                        if (
+                            normalizeUsername(
+                                otherChannel.name
+                            ) === requestedKey
+                        ) {
+                            nameAlreadyUsed = true;
+                            return true;
+                        }
+
+                        return false;
+                    }
+                );
+
+                if (nameAlreadyUsed) {
+                    sendHttpJson(res, 409, {
+                        success: false,
+                        code: "CHANNEL_NAME_EXISTS",
+                        error: "Este nome de canal já está em uso"
+                    });
+                    return;
+                }
+            }
+        }
+
         const updatedName =
             requestedName !== null
                 ? requestedName
