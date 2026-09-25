@@ -6786,69 +6786,6 @@ const httpServer =
             }
 
             // ------------------------------------------------
-            // CHANNEL INVITE LANDING PAGE
-            // ------------------------------------------------
-
-            const invitePath =
-                req.method === "GET"
-                    ? req.url.split("?")[0]
-                    : "";
-
-            const inviteMatch =
-                invitePath.match(
-                    /^\/invite\/channel\/([0-9]{8})\/?$/
-                );
-
-            if (inviteMatch) {
-                const channelId =
-                    inviteMatch[1];
-
-                const appLink =
-                    `zlinktalk://channel/${channelId}`;
-
-                const storeUrl =
-                    "https://dinizrfoficial.github.io/store/";
-
-                const html = `<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Convite Z-Link Talk</title>
-<style>
-body{margin:0;background:#111;color:#fff;font-family:Arial,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
-.card{width:min(520px,100%);background:#1b1d20;border:1px solid #34383e;border-radius:18px;padding:28px;box-sizing:border-box;text-align:center}
-h1{font-size:26px;margin:0 0 14px}.muted{color:#b8bdc6;line-height:1.5}.btn{display:block;margin-top:18px;padding:15px 18px;border-radius:12px;text-decoration:none;font-weight:700}.primary{background:#fff;color:#111}.secondary{background:#2a2e34;color:#fff}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>Convite Z-Link Talk</h1>
-<p class="muted">Abra este convite no aplicativo Z-Link Talk para visualizar e adicionar o canal.</p>
-<a class="btn primary" href="${appLink}">ABRIR NO Z-LINK TALK</a>
-<a class="btn secondary" href="${storeUrl}">INSTALAR Z-LINK TALK</a>
-</div>
-<script>
-setTimeout(function(){ window.location.href = ${JSON.stringify(appLink)}; }, 250);
-</script>
-</body>
-</html>`;
-
-                res.writeHead(
-                    200,
-                    {
-                        "Content-Type":
-                            "text/html; charset=utf-8",
-                        "Cache-Control":
-                            "no-store"
-                    }
-                );
-
-                res.end(html);
-                return;
-            }
-
-            // ------------------------------------------------
             // HEALTH
             // ------------------------------------------------
 
