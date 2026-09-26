@@ -10256,9 +10256,37 @@ function receiveCandidatesForClient(ws) {
     const lastMessageReplayChannelId =
         String(ws.lastMessageReplayChannelId || "");
 
+    const backgroundReceiveFocusActive =
+        ws.backgroundReceiveFocusActive === true;
+
+    const backgroundReceiveFocusChannelId =
+        String(
+            ws.backgroundReceiveFocusChannelId ||
+            ""
+        );
+
+    /*
+     * Em segundo plano o Android define explicitamente o RX:
+     * - padrão válido -> somente esse canal;
+     * - sem padrão remoto / Echo padrão -> nenhum RX do servidor.
+     */
+    if (
+        backgroundReceiveFocusActive &&
+        !backgroundReceiveFocusChannelId &&
+        !assistantExclusiveChannelId &&
+        !lastMessageReplayChannelId
+    ) {
+        return [];
+    }
+
     const exclusiveReceiveChannelId =
         assistantExclusiveChannelId ||
-        lastMessageReplayChannelId;
+        lastMessageReplayChannelId ||
+        (
+            backgroundReceiveFocusActive
+                ? backgroundReceiveFocusChannelId
+                : ""
+        );
 
     for (const [channelId, state] of activeTransmitters) {
         if (
@@ -10485,6 +10513,151 @@ function applyAssistantExclusiveFocus(
     sendJson(
         ws,
         buildChannelStateMessage(ws)
+    );
+}
+
+function applyBackgroundReceiveFocus(
+    ws,
+    enabled,
+    channelId
+) {
+    const nextEnabled =
+        enabled === true;
+
+    const normalized =
+        nextEnabled &&
+        channelId
+            ? String(channelId).trim()
+            : "";
+
+    const nextChannelId =
+        normalized || null;
+
+    const sameState =
+        ws.backgroundReceiveFocusActive ===
+            nextEnabled &&
+        String(
+            ws.backgroundReceiveFocusChannelId ||
+            ""
+        ) ===
+            String(
+                nextChannelId ||
+                ""
+            );
+
+    if (sameState) {
+        /*
+         * Reafirmação idempotente. Se alguma transição anterior deixou um
+         * RX fora do foco, encerra-o agora.
+         */
+        if (
+            nextEnabled &&
+            ws.rxChannelId &&
+            (
+                !nextChannelId ||
+                String(ws.rxChannelId) !==
+                    String(nextChannelId)
+            )
+        ) {
+            const previousState =
+                activeTransmitters.get(
+                    ws.rxChannelId
+                );
+
+            sendJson(
+                ws,
+                {
+                    type:
+                        "stop_tx",
+                    from:
+                        previousState?.userId ||
+                        "",
+                    channelId:
+                        ws.rxChannelId,
+                    suppressRoger:
+                        true,
+                    reason:
+                        "background_receive_focus"
+                }
+            );
+
+            ws.rxChannelId =
+                null;
+        }
+
+        ensureReceiveSelectionNow(
+            ws,
+            false
+        );
+
+        return;
+    }
+
+    const previousRx =
+        ws.rxChannelId ||
+        null;
+
+    ws.backgroundReceiveFocusActive =
+        nextEnabled;
+
+    ws.backgroundReceiveFocusChannelId =
+        nextChannelId;
+
+    clearReceiveSelectionTimer(
+        ws
+    );
+
+    /*
+     * Entrando no background, qualquer RX diferente do padrão é cortado.
+     * Saindo do background, o RX atual não é artificialmente interrompido;
+     * apenas a arbitragem multicanal volta a ser permitida.
+     */
+    const shouldStopPrevious =
+        nextEnabled &&
+        !!previousRx &&
+        (
+            !nextChannelId ||
+            String(previousRx) !==
+                String(nextChannelId)
+        );
+
+    if (shouldStopPrevious) {
+        const previousState =
+            activeTransmitters.get(
+                previousRx
+            );
+
+        sendJson(
+            ws,
+            {
+                type:
+                    "stop_tx",
+                from:
+                    previousState?.userId ||
+                    "",
+                channelId:
+                    previousRx,
+                suppressRoger:
+                    true,
+                reason:
+                    "background_receive_focus"
+            }
+        );
+
+        ws.rxChannelId =
+            null;
+    }
+
+    ensureReceiveSelectionNow(
+        ws,
+        false
+    );
+
+    sendJson(
+        ws,
+        buildChannelStateMessage(
+            ws
+        )
     );
 }
 
@@ -11272,6 +11445,8 @@ async function handleJson(
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
             ws.lastMessageReplayChannelId = null;
+            ws.backgroundReceiveFocusActive = false;
+            ws.backgroundReceiveFocusChannelId = null;
 
         } catch (error) {
             console.error(
@@ -11286,6 +11461,8 @@ async function handleJson(
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
             ws.lastMessageReplayChannelId = null;
+            ws.backgroundReceiveFocusActive = false;
+            ws.backgroundReceiveFocusChannelId = null;
         }
 
         ws.txChannelId =
@@ -11498,6 +11675,105 @@ async function handleJson(
     }
 
     // ========================================================
+    // SEGUNDO PLANO - FOCO EXCLUSIVO NO CANAL PADRÃO
+    // ========================================================
+
+    if (
+        data.type ===
+        "background_receive_focus"
+    ) {
+        const enabled =
+            data.enabled === true;
+
+        const requestedChannelId =
+            String(
+                data.channelId ||
+                ""
+            ).trim();
+
+        if (!enabled) {
+            applyBackgroundReceiveFocus(
+                ws,
+                false,
+                null
+            );
+
+            sendJson(
+                ws,
+                {
+                    type:
+                        "background_receive_focus_applied",
+                    enabled:
+                        false,
+                    channelId:
+                        null
+                }
+            );
+
+            return;
+        }
+
+        /*
+         * Canal vazio é intencional: significa background sem padrão remoto
+         * (inclusive Echo padrão). Nesse caso nenhum canal do servidor fica
+         * elegível para RX.
+         */
+        if (
+            requestedChannelId &&
+            (
+                !ws.enabledChannelIds?.has(
+                    requestedChannelId
+                ) ||
+                ws.blockedChannelIds?.has(
+                    requestedChannelId
+                )
+            )
+        ) {
+            applyBackgroundReceiveFocus(
+                ws,
+                true,
+                null
+            );
+
+            sendJson(
+                ws,
+                {
+                    type:
+                        "background_receive_focus_denied",
+                    channelId:
+                        requestedChannelId,
+                    message:
+                        "Canal padrão indisponível para recepção em segundo plano."
+                }
+            );
+
+            return;
+        }
+
+        applyBackgroundReceiveFocus(
+            ws,
+            true,
+            requestedChannelId ||
+                null
+        );
+
+        sendJson(
+            ws,
+            {
+                type:
+                    "background_receive_focus_applied",
+                enabled:
+                    true,
+                channelId:
+                    requestedChannelId ||
+                    null
+            }
+        );
+
+        return;
+    }
+
+    // ========================================================
     // MODO ASSISTENTE - FOCO EXCLUSIVO DE RECEPÇÃO
     // ========================================================
 
@@ -11524,12 +11800,24 @@ async function handleJson(
                 requestedChannelId
             );
 
+        const backgroundFocusMatches =
+            ws.backgroundReceiveFocusActive ===
+                true &&
+            String(
+                ws.backgroundReceiveFocusChannelId ||
+                ""
+            ) ===
+                requestedChannelId;
+
         const allowed =
             !!requestedChannelId &&
             !!channel &&
             ws.enabledChannelIds?.has(requestedChannelId) &&
-            String(ws.activeChannelId || "") ===
-                requestedChannelId &&
+            (
+                String(ws.activeChannelId || "") ===
+                    requestedChannelId ||
+                backgroundFocusMatches
+            ) &&
             isChannelOwnerUser(
                 channel,
                 ws.userId
@@ -12588,6 +12876,12 @@ wss.on(
             null;
 
         ws.rxSelectionTimer =
+            null;
+
+        ws.backgroundReceiveFocusActive =
+            false;
+
+        ws.backgroundReceiveFocusChannelId =
             null;
 
         ws.isAlive =
