@@ -1,5 +1,20 @@
 const http = require("http");
 const WebSocket = require("ws");
+const { spawn } = require("child_process");
+
+let ffmpegPath =
+    process.env.FFMPEG_PATH ||
+    null;
+
+if (!ffmpegPath) {
+    try {
+        ffmpegPath =
+            require("ffmpeg-static");
+    } catch (_) {
+        ffmpegPath =
+            "ffmpeg";
+    }
+}
 const fs = require("fs");
 const crypto = require("crypto");
 
@@ -182,6 +197,396 @@ const clients =
  */
 const masterAdminMonitors =
     new Set();
+
+
+/*
+ * Áudio do painel mestre.
+ *
+ * O app atual transmite AMR-WB (16 kHz, mono, 20 ms).
+ * Navegadores desktop não oferecem decodificação AMR-WB de forma confiável,
+ * então o servidor converte SOMENTE o fluxo do painel mestre para PCM S16LE.
+ *
+ * Pacote enviado ao navegador:
+ *   0  = 0x5A  ('Z')
+ *   1  = 0x4C  ('L')
+ *   2  = 0x50  ('P')
+ *   3  = 0x43  ('C')
+ *   4  = 0x4D  ('M')
+ *   5  = 0x01  (versão)
+ *   6+ = PCM signed 16-bit little-endian, 16 kHz, mono
+ */
+const MASTER_PCM_HEADER =
+    Buffer.from([
+        0x5A,
+        0x4C,
+        0x50,
+        0x43,
+        0x4D,
+        0x01
+    ]);
+
+const AMR_WB_FILE_HEADER =
+    Buffer.from(
+        "#!AMR-WB\n",
+        "ascii"
+    );
+
+function stopMasterMonitorTranscoder(
+    ws,
+    reason = "stop"
+) {
+    const child =
+        ws?.masterMonitorTranscoder;
+
+    ws.masterMonitorTranscoder =
+        null;
+
+    if (!child) {
+        return;
+    }
+
+    child.zlinkExpectedStop =
+        true;
+
+    try {
+        if (
+            child.stdin &&
+            !child.stdin.destroyed
+        ) {
+            child.stdin.end();
+        }
+    } catch (_) {
+    }
+
+    try {
+        child.kill(
+            "SIGKILL"
+        );
+    } catch (_) {
+    }
+
+    console.log(
+        `[MASTER AUDIO] transcoder stop reason=${reason}`
+    );
+}
+
+function startMasterMonitorTranscoder(
+    ws
+) {
+    stopMasterMonitorTranscoder(
+        ws,
+        "restart"
+    );
+
+    if (
+        !ws ||
+        ws.readyState !==
+            WebSocket.OPEN
+    ) {
+        return false;
+    }
+
+    let child;
+
+    try {
+        child =
+            spawn(
+                ffmpegPath,
+                [
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+
+                    /*
+                     * O cabeçalho AMR-WB é escrito no stdin logo após o spawn.
+                     * O formato amr detecta AMR-WB através desse cabeçalho.
+                     */
+                    "-f",
+                    "amr",
+                    "-i",
+                    "pipe:0",
+
+                    "-vn",
+
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+
+                    "-f",
+                    "s16le",
+                    "pipe:1"
+                ],
+                {
+                    stdio: [
+                        "pipe",
+                        "pipe",
+                        "pipe"
+                    ]
+                }
+            );
+    } catch (
+        error
+    ) {
+        console.error(
+            "[MASTER AUDIO] não foi possível iniciar FFmpeg:",
+            error?.message || error
+        );
+
+        sendMasterMonitorJson(
+            ws,
+            {
+                type:
+                    "admin_monitor_audio_error",
+
+                message:
+                    "O servidor não conseguiu iniciar o decodificador AMR-WB."
+            }
+        );
+
+        return false;
+    }
+
+    ws.masterMonitorTranscoder =
+        child;
+
+    ws.masterMonitorTranscoderError =
+        "";
+
+    child.stdout.on(
+        "data",
+        chunk => {
+            if (
+                !chunk ||
+                chunk.length === 0 ||
+                ws.readyState !==
+                    WebSocket.OPEN ||
+                ws.masterMonitorTranscoder !==
+                    child
+            ) {
+                return;
+            }
+
+            try {
+                ws.send(
+                    Buffer.concat(
+                        [
+                            MASTER_PCM_HEADER,
+                            chunk
+                        ]
+                    ),
+                    {
+                        binary: true
+                    }
+                );
+            } catch (_) {
+            }
+        }
+    );
+
+    child.stderr.on(
+        "data",
+        chunk => {
+            const text =
+                String(
+                    chunk || ""
+                );
+
+            if (!text) {
+                return;
+            }
+
+            ws.masterMonitorTranscoderError =
+                (
+                    String(
+                        ws.masterMonitorTranscoderError ||
+                        ""
+                    ) +
+                    text
+                ).slice(
+                    -4000
+                );
+        }
+    );
+
+    child.on(
+        "error",
+        error => {
+            if (
+                child.zlinkExpectedStop
+            ) {
+                return;
+            }
+
+            console.error(
+                "[MASTER AUDIO] FFmpeg error:",
+                error?.message || error
+            );
+
+            sendMasterMonitorJson(
+                ws,
+                {
+                    type:
+                        "admin_monitor_audio_error",
+
+                    message:
+                        "Falha no decodificador de áudio do servidor."
+                }
+            );
+        }
+    );
+
+    child.on(
+        "close",
+        code => {
+            if (
+                ws.masterMonitorTranscoder ===
+                    child
+            ) {
+                ws.masterMonitorTranscoder =
+                    null;
+            }
+
+            if (
+                child.zlinkExpectedStop
+            ) {
+                return;
+            }
+
+            const detail =
+                String(
+                    ws.masterMonitorTranscoderError ||
+                    ""
+                ).trim();
+
+            console.error(
+                `[MASTER AUDIO] FFmpeg encerrou code=${code}` +
+                (
+                    detail
+                        ? ` detail=${detail}`
+                        : ""
+                )
+            );
+
+            if (
+                ws.readyState ===
+                    WebSocket.OPEN &&
+                ws.masterMonitorChannelId
+            ) {
+                sendMasterMonitorJson(
+                    ws,
+                    {
+                        type:
+                            "admin_monitor_audio_error",
+
+                        message:
+                            "O decodificador AMR-WB do servidor foi encerrado."
+                    }
+                );
+            }
+        }
+    );
+
+    /*
+     * AMR-WB em formato storage precisa deste magic antes dos frames.
+     * Os pacotes gerados pelo MediaCodec do Android já contêm o byte TOC
+     * de cada frame, portanto basta remover o cabeçalho Z-Link de 6 bytes
+     * e entregá-los sequencialmente ao demuxer AMR.
+     */
+    try {
+        child.stdin.write(
+            AMR_WB_FILE_HEADER
+        );
+    } catch (
+        error
+    ) {
+        console.error(
+            "[MASTER AUDIO] falha escrevendo cabeçalho AMR-WB:",
+            error?.message || error
+        );
+
+        stopMasterMonitorTranscoder(
+            ws,
+            "header-error"
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+function feedMasterMonitorAudioPacket(
+    ws,
+    packet
+) {
+    if (
+        !ws ||
+        ws.readyState !==
+            WebSocket.OPEN ||
+        !Buffer.isBuffer(
+            packet
+        ) ||
+        packet.length <=
+            AUDIO_HEADER_SIZE ||
+        packet[0] !==
+            AUDIO_MAGIC_0 ||
+        packet[1] !==
+            AUDIO_MAGIC_1 ||
+        packet[2] !==
+            AUDIO_VERSION
+    ) {
+        return;
+    }
+
+    let child =
+        ws.masterMonitorTranscoder;
+
+    if (
+        !child ||
+        !child.stdin ||
+        child.stdin.destroyed
+    ) {
+        if (
+            !startMasterMonitorTranscoder(
+                ws
+            )
+        ) {
+            return;
+        }
+
+        child =
+            ws.masterMonitorTranscoder;
+    }
+
+    if (
+        !child ||
+        !child.stdin ||
+        child.stdin.destroyed
+    ) {
+        return;
+    }
+
+    const amrFrame =
+        packet.subarray(
+            AUDIO_HEADER_SIZE
+        );
+
+    try {
+        child.stdin.write(
+            amrFrame
+        );
+    } catch (
+        error
+    ) {
+        console.error(
+            "[MASTER AUDIO] falha enviando AMR-WB ao FFmpeg:",
+            error?.message || error
+        );
+    }
+}
 
 // ============================================================
 // TRANSMISSORES POR CANAL
@@ -7910,6 +8315,20 @@ function sendMasterMonitorTxStart(ws, channelId, state) {
     const txKey =
         `${channelId}:${state.userId}:${Number(state.startedAt || 0)}`;
 
+    if (
+        ws.masterMonitorTxKey !==
+            txKey
+    ) {
+        /*
+         * Cada TX vem de uma instância de encoder independente no Android.
+         * Reiniciar o decoder no começo evita carregar estado AMR-WB do
+         * falante anterior e elimina artefatos entre transmissões.
+         */
+        startMasterMonitorTranscoder(
+            ws
+        );
+    }
+
     ws.masterMonitorTxKey = txKey;
 
     sendMasterMonitorJson(ws, {
@@ -7940,6 +8359,11 @@ function notifyMasterMonitorsTxStop(channelId, state) {
         });
 
         monitor.masterMonitorTxKey = null;
+
+        stopMasterMonitorTranscoder(
+            monitor,
+            "tx-stop"
+        );
     }
 }
 
@@ -7968,6 +8392,8 @@ async function handleMasterMonitorJson(ws, data) {
         ws.isMasterAdminMonitor = true;
         ws.masterMonitorChannelId = null;
         ws.masterMonitorTxKey = null;
+        ws.masterMonitorTranscoder = null;
+        ws.masterMonitorTranscoderError = "";
         masterAdminMonitors.add(ws);
 
         sendMasterMonitorJson(ws, {
@@ -7994,6 +8420,11 @@ async function handleMasterMonitorJson(ws, data) {
             return true;
         }
 
+        stopMasterMonitorTranscoder(
+            ws,
+            "channel-select"
+        );
+
         ws.masterMonitorChannelId = channelId;
         ws.masterMonitorTxKey = null;
 
@@ -8011,7 +8442,10 @@ async function handleMasterMonitorJson(ws, data) {
                 for (const packet of state.bootstrapPackets) {
                     if (ws.readyState !== WebSocket.OPEN) break;
                     try {
-                        ws.send(packet, { binary: true });
+                        feedMasterMonitorAudioPacket(
+                            ws,
+                            packet
+                        );
                     } catch (_) {
                         break;
                     }
@@ -8023,6 +8457,11 @@ async function handleMasterMonitorJson(ws, data) {
     }
 
     if (data.type === "admin_monitor_stop") {
+        stopMasterMonitorTranscoder(
+            ws,
+            "monitor-stop"
+        );
+
         ws.masterMonitorChannelId = null;
         ws.masterMonitorTxKey = null;
 
@@ -11675,6 +12114,12 @@ wss.on(
         ws.masterMonitorTxKey =
             null;
 
+        ws.masterMonitorTranscoder =
+            null;
+
+        ws.masterMonitorTranscoderError =
+            "";
+
         ws.userId =
             null;
 
@@ -11869,9 +12314,9 @@ wss.on(
                         }
 
                         try {
-                            monitor.send(
-                                data,
-                                { binary: true }
+                            feedMasterMonitorAudioPacket(
+                                monitor,
+                                data
                             );
                         } catch (_) {
                         }
@@ -11963,6 +12408,11 @@ wss.on(
                 clearReceiveSelectionTimer(ws);
 
                 if (ws.isMasterAdminMonitor) {
+                    stopMasterMonitorTranscoder(
+                        ws,
+                        "websocket-close"
+                    );
+
                     masterAdminMonitors.delete(ws);
                     ws.masterMonitorChannelId = null;
                     ws.masterMonitorTxKey = null;
