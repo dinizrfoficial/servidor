@@ -5495,7 +5495,24 @@ async function handleSessionOpen(
                 req
             );
 
-    } catch (_) {
+    } catch (error) {
+
+        if (error?.code === "USER_BANNED") {
+            sendHttpJson(
+                res,
+                403,
+                {
+                    success: false,
+                    code: "USER_BANNED",
+                    error: "Você foi banido.",
+                    reason: String(
+                        error.reason ||
+                            "Conta banida pela administração do Z-Link Talk."
+                    )
+                }
+            );
+            return;
+        }
 
         sendHttpJson(
             res,
@@ -7267,20 +7284,27 @@ async function verifyUserIdTokenStrict(token) {
     }
 
     /*
-     * checkRevoked=true também força consulta ao registro da conta e impede
-     * que tokens antigos de uma conta desabilitada/revogada continuem válidos.
+     * Primeiro decodificamos o token sem a checagem de revogação para obter
+     * o UID. Isso permite localizar o motivo do banimento mesmo depois que a
+     * conta foi desabilitada/revogada pelo painel mestre.
+     *
+     * Se não houver banimento global, fazemos a validação estrita com
+     * checkRevoked=true normalmente.
      */
-    const decoded = await auth.verifyIdToken(token, true);
-
-    const ban = await getGlobalBanInfo(decoded.uid);
+    const decodedBasic = await auth.verifyIdToken(token, false);
+    const ban = await getGlobalBanInfo(decodedBasic.uid);
 
     if (ban?.active === true) {
         const error = new Error("USER_BANNED");
         error.code = "USER_BANNED";
+        error.uid = decodedBasic.uid;
+        error.reason = String(
+            ban.reason || "Conta banida pela administração do Z-Link Talk."
+        );
         throw error;
     }
 
-    return decoded;
+    return auth.verifyIdToken(token, true);
 }
 
 async function masterLoadAuthUsers() {
@@ -7656,6 +7680,14 @@ async function handleMasterBanUser(req, res, banned) {
         return;
     }
 
+    if (banned && !reason) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: "Informe o motivo do banimento."
+        });
+        return;
+    }
+
     try {
         if (banned) {
             await auth.updateUser(uid, { disabled: true });
@@ -7664,7 +7696,7 @@ async function handleMasterBanUser(req, res, banned) {
             await db.ref().update({
                 [`users/${uid}/globalBan`]: {
                     active: true,
-                    reason: reason || "Conta bloqueada pela administração",
+                    reason: reason,
                     bannedAt: Date.now()
                 },
                 [`sessions/${uid}`]: null
@@ -7676,7 +7708,9 @@ async function handleMasterBanUser(req, res, banned) {
             if (ws && isOpen(ws)) {
                 sendJson(ws, {
                     type: "session_revoked",
-                    reason: "Conta bloqueada pela administração do Z-Link Talk."
+                    code: "GLOBAL_BAN",
+                    title: "VOCÊ FOI BANIDO",
+                    reason: reason
                 });
 
                 removeClientPresence(ws, "master_global_ban", false);
@@ -10670,6 +10704,37 @@ async function handleJson(
                 );
 
         } catch (error) {
+
+            if (error?.code === "USER_BANNED") {
+                const banReason = String(
+                    error.reason ||
+                        "Conta banida pela administração do Z-Link Talk."
+                );
+
+                console.warn(
+                    `[IDENTIFY] conta banida uid=${error.uid || "?"}`
+                );
+
+                sendJson(
+                    ws,
+                    {
+                        type: "session_revoked",
+                        code: "GLOBAL_BAN",
+                        title: "VOCÊ FOI BANIDO",
+                        reason: banReason
+                    }
+                );
+
+                try {
+                    ws.close(
+                        4003,
+                        "Account banned"
+                    );
+                } catch (_) {
+                }
+
+                return;
+            }
 
             console.warn(
                 "[IDENTIFY] token inválido:",
