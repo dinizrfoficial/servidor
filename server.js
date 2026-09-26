@@ -155,6 +155,16 @@ const PORT =
         process.env.PORT || 3000
     );
 
+/*
+ * Token exclusivo do painel web mestre.
+ * Configure no Render como ZLINK_MASTER_ADMIN_TOKEN.
+ * Nunca coloque esse valor dentro do index.html hospedado no GitHub.
+ */
+const MASTER_ADMIN_TOKEN =
+    String(
+        process.env.ZLINK_MASTER_ADMIN_TOKEN || ""
+    ).trim();
+
 // ============================================================
 // WEBSOCKET CLIENTES
 // ============================================================
@@ -164,6 +174,14 @@ const PORT =
 
 const clients =
     new Map();
+
+/*
+ * WebSockets exclusivos do painel mestre. Eles não entram na lista normal de
+ * usuários, não criam sessão de PTT e recebem somente o canal explicitamente
+ * selecionado para monitoramento.
+ */
+const masterAdminMonitors =
+    new Set();
 
 // ============================================================
 // TRANSMISSORES POR CANAL
@@ -604,6 +622,10 @@ function buildRemovedChannelMembership(
 function removedChannelMessage(reason) {
     if (String(reason || "") === "owner_account_deleted") {
         return "Este canal foi removido porque a conta do proprietário foi excluída.";
+    }
+
+    if (String(reason || "") === "master_deleted") {
+        return "Este canal foi removido pela administração do Z-Link Talk.";
     }
 
     return "Este canal foi removido pelo proprietário.";
@@ -5024,7 +5046,7 @@ async function verifyBearerToken(
         );
     }
 
-    return auth.verifyIdToken(
+    return verifyUserIdTokenStrict(
         token
     );
 }
@@ -6757,6 +6779,1273 @@ async function handleReleaseUsername(
 }
 
 // ============================================================
+// PAINEL MESTRE / ADMINISTRAÇÃO GLOBAL
+// ============================================================
+
+function masterTokenMatches(candidate) {
+    const supplied = String(candidate || "").trim();
+
+    if (!MASTER_ADMIN_TOKEN || !supplied) {
+        return false;
+    }
+
+    const expectedBuffer = Buffer.from(MASTER_ADMIN_TOKEN, "utf8");
+    const suppliedBuffer = Buffer.from(supplied, "utf8");
+
+    if (expectedBuffer.length !== suppliedBuffer.length) {
+        return false;
+    }
+
+    return crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function requireMasterAdminRequest(req) {
+    if (!MASTER_ADMIN_TOKEN) {
+        const error = new Error("MASTER_ADMIN_NOT_CONFIGURED");
+        error.code = "MASTER_ADMIN_NOT_CONFIGURED";
+        throw error;
+    }
+
+    const token = getBearerToken(req);
+
+    if (!masterTokenMatches(token)) {
+        const error = new Error("MASTER_ADMIN_UNAUTHORIZED");
+        error.code = "MASTER_ADMIN_UNAUTHORIZED";
+        throw error;
+    }
+
+    return true;
+}
+
+function sendMasterAuthError(res, error) {
+    if (error?.code === "MASTER_ADMIN_NOT_CONFIGURED") {
+        sendHttpJson(res, 503, {
+            success: false,
+            error:
+                "Painel mestre não configurado. Defina ZLINK_MASTER_ADMIN_TOKEN no servidor."
+        });
+        return;
+    }
+
+    sendHttpJson(res, 401, {
+        success: false,
+        error: "Token mestre inválido"
+    });
+}
+
+async function getGlobalBanInfo(uid) {
+    if (!db || !uid) {
+        return null;
+    }
+
+    const snapshot = await db
+        .ref(`users/${uid}/globalBan`)
+        .get();
+
+    if (!snapshot.exists()) {
+        return null;
+    }
+
+    const value = snapshot.val() || {};
+
+    return {
+        active: value.active === true,
+        reason: String(value.reason || ""),
+        bannedAt: Number(value.bannedAt || 0),
+        unbannedAt: Number(value.unbannedAt || 0)
+    };
+}
+
+async function verifyUserIdTokenStrict(token) {
+    if (!token || !auth) {
+        throw new Error("UNAUTHORIZED");
+    }
+
+    /*
+     * checkRevoked=true também força consulta ao registro da conta e impede
+     * que tokens antigos de uma conta desabilitada/revogada continuem válidos.
+     */
+    const decoded = await auth.verifyIdToken(token, true);
+
+    const ban = await getGlobalBanInfo(decoded.uid);
+
+    if (ban?.active === true) {
+        const error = new Error("USER_BANNED");
+        error.code = "USER_BANNED";
+        throw error;
+    }
+
+    return decoded;
+}
+
+async function masterLoadAuthUsers() {
+    const result = new Map();
+    let pageToken = undefined;
+
+    do {
+        const page = await auth.listUsers(1000, pageToken);
+
+        for (const userRecord of page.users) {
+            result.set(userRecord.uid, userRecord);
+        }
+
+        pageToken = page.pageToken;
+    } while (pageToken);
+
+    return result;
+}
+
+function masterUserDisplayName(profile, authRecord, liveClient) {
+    return String(
+        profile?.username ||
+        authRecord?.displayName ||
+        liveClient?.name ||
+        "Usuário"
+    ).trim() || "Usuário";
+}
+
+async function buildMasterOverview() {
+    const [usersSnapshot, channelsSnapshot, authUsers] = await Promise.all([
+        db.ref("users").get(),
+        db.ref("channels").get(),
+        masterLoadAuthUsers()
+    ]);
+
+    const usersRaw = usersSnapshot.exists()
+        ? usersSnapshot.val() || {}
+        : {};
+
+    const channelsRaw = channelsSnapshot.exists()
+        ? channelsSnapshot.val() || {}
+        : {};
+
+    const allUids = new Set([
+        ...Object.keys(usersRaw),
+        ...authUsers.keys()
+    ]);
+
+    const users = [];
+
+    for (const uid of allUids) {
+        const profile = usersRaw[uid] || {};
+        const authRecord = authUsers.get(uid) || null;
+        const liveClient = clients.get(uid) || null;
+        const memberships = profile.channels || {};
+        const ban = profile.globalBan || {};
+
+        users.push({
+            uid,
+            name: masterUserDisplayName(profile, authRecord, liveClient),
+            email: String(authRecord?.email || ""),
+            disabled: authRecord?.disabled === true,
+            banned: ban.active === true || authRecord?.disabled === true,
+            banReason: String(ban.reason || ""),
+            bannedAt: Number(ban.bannedAt || 0),
+            online: !!liveClient && isOpen(liveClient),
+            activeChannelId: String(liveClient?.activeChannelId || ""),
+            visibleChannelId: String(liveClient?.visibleChannelId || ""),
+            defaultChannelId: String(profile.defaultChannelId || ""),
+            channelCount: Object.entries(memberships)
+                .filter(([, membership]) => membership?.removed !== true)
+                .length
+        });
+    }
+
+    users.sort((a, b) =>
+        a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" })
+    );
+
+    const userByUid = new Map(users.map(user => [user.uid, user]));
+    const channels = [];
+
+    for (const [channelId, channelValue] of Object.entries(channelsRaw)) {
+        const channel = channelValue || {};
+        const ownerUid = String(channel.ownerUid || "");
+        const moderators = getChannelModeratorUids(channel);
+        const blockedUsers = channel.blockedUsers || {};
+        const trustedUsers = channel.trustedUsers || {};
+        const members = [];
+
+        for (const [uid, profileValue] of Object.entries(usersRaw)) {
+            const profile = profileValue || {};
+            const membership = profile.channels?.[channelId];
+
+            if (!membership || membership.removed === true) {
+                continue;
+            }
+
+            const user = userByUid.get(uid) || {
+                uid,
+                name: "Usuário",
+                email: "",
+                online: false,
+                banned: false,
+                disabled: false
+            };
+
+            const isOwner = uid === ownerUid;
+            const isModerator = !isOwner && moderators.includes(uid);
+            const blocked = Object.prototype.hasOwnProperty.call(
+                blockedUsers,
+                uid
+            );
+
+            members.push({
+                uid,
+                name: user.name,
+                email: user.email,
+                online: user.online,
+                banned: user.banned,
+                enabled: membership.enabled !== false && !blocked,
+                blocked,
+                trusted:
+                    isOwner ||
+                    isModerator ||
+                    Object.prototype.hasOwnProperty.call(trustedUsers, uid),
+                role: isOwner
+                    ? "owner"
+                    : (isModerator ? "moderator" : "user"),
+                isInChannel:
+                    String(clients.get(uid)?.visibleChannelId || "") ===
+                    String(channelId)
+            });
+        }
+
+        members.sort((a, b) => {
+            const roleWeight = role =>
+                role === "owner" ? 0 : (role === "moderator" ? 1 : 2);
+
+            return (
+                roleWeight(a.role) - roleWeight(b.role) ||
+                a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" })
+            );
+        });
+
+        const active = activeTransmitters.get(channelId) || null;
+
+        channels.push({
+            id: channelId,
+            name: String(channel.name || "Canal"),
+            description: String(channel.description || ""),
+            type: String(channel.type || "public"),
+            ownerUid,
+            ownerName: userByUid.get(ownerUid)?.name || "Usuário",
+            moderators,
+            memberCount: members.length,
+            onlineCount: members.filter(member => member.online).length,
+            blockedCount: Object.keys(blockedUsers).length,
+            members,
+            activeTransmission: active
+                ? {
+                    userId: String(active.userId || ""),
+                    name: String(active.name || active.userId || "Usuário"),
+                    startedAt: Number(active.startedAt || 0),
+                    assistantGenerated: active.assistantGenerated === true
+                }
+                : null,
+            createdAt: Number(channel.createdAt || 0),
+            updatedAt: Number(channel.updatedAt || 0)
+        });
+    }
+
+    channels.sort((a, b) =>
+        a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" })
+    );
+
+    return {
+        success: true,
+        timestamp: Date.now(),
+        stats: {
+            users: users.length,
+            onlineUsers: users.filter(user => user.online).length,
+            bannedUsers: users.filter(user => user.banned).length,
+            channels: channels.length,
+            activeChannels: channels.filter(channel => channel.activeTransmission).length
+        },
+        users,
+        channels
+    };
+}
+
+async function refreshAllChannelParticipants(channelId) {
+    const usersSnapshot = await db.ref("users").get();
+    const allUsers = usersSnapshot.exists()
+        ? usersSnapshot.val() || {}
+        : {};
+
+    const affected = [];
+
+    for (const [uid, profileValue] of Object.entries(allUsers)) {
+        const membership = profileValue?.channels?.[channelId];
+
+        if (membership && membership.removed !== true) {
+            affected.push(uid);
+        }
+    }
+
+    await Promise.allSettled(
+        affected.map(uid => refreshConnectedClientChannels(uid))
+    );
+
+    return affected;
+}
+
+async function handleMasterOverview(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    if (!firebaseReady || !db || !auth) {
+        sendHttpJson(res, 503, {
+            success: false,
+            error: "Firebase indisponível"
+        });
+        return;
+    }
+
+    try {
+        sendHttpJson(res, 200, await buildMasterOverview());
+    } catch (error) {
+        console.error("[MASTER OVERVIEW]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível carregar o painel mestre"
+        });
+    }
+}
+
+async function handleMasterRenameUser(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const uid = String(body.userId || "").trim();
+    const username = String(body.username || "").trim();
+    const validation = validateUsername(username);
+
+    if (!uid || validation) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: validation || "Usuário inválido"
+        });
+        return;
+    }
+
+    try {
+        const profile = await getUserProfile(uid);
+        const oldUsername = String(profile.username || "").trim();
+        const oldKey = String(
+            profile.usernameKey || usernameKey(oldUsername)
+        ).trim();
+        const newKey = usernameKey(username);
+
+        const existing = await db.ref(`usernames/${newKey}`).get();
+
+        if (
+            existing.exists() &&
+            String(existing.val() || "") !== uid
+        ) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Este nome de usuário já está em uso"
+            });
+            return;
+        }
+
+        const updates = {
+            [`users/${uid}/username`]: username,
+            [`users/${uid}/usernameKey`]: newKey,
+            [`users/${uid}/updatedAt`]: Date.now(),
+            [`usernames/${newKey}`]: uid
+        };
+
+        if (oldKey && oldKey !== newKey) {
+            const oldMapping = await db.ref(`usernames/${oldKey}`).get();
+
+            if (
+                !oldMapping.exists() ||
+                String(oldMapping.val() || "") === uid
+            ) {
+                updates[`usernames/${oldKey}`] = null;
+            }
+        }
+
+        await db.ref().update(updates);
+
+        try {
+            await auth.updateUser(uid, { displayName: username });
+        } catch (error) {
+            console.error("[MASTER USER RENAME][AUTH]", error.message);
+        }
+
+        const ws = clients.get(uid);
+
+        if (ws && isOpen(ws)) {
+            ws.name = username;
+
+            for (const state of activeTransmitters.values()) {
+                if (state.userId === uid) {
+                    state.name = username;
+                }
+            }
+
+            sendJson(ws, {
+                type: "user_update",
+                id: uid,
+                name: username,
+                avatar: ws.avatar || ""
+            });
+        }
+
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            userId: uid,
+            username
+        });
+    } catch (error) {
+        console.error("[MASTER USER RENAME]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar o nome do usuário"
+        });
+    }
+}
+
+async function handleMasterBanUser(req, res, banned) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const uid = String(body.userId || "").trim();
+    const reason = String(body.reason || "").trim().slice(0, 240);
+
+    if (!uid) {
+        sendHttpJson(res, 400, { success: false, error: "Usuário inválido" });
+        return;
+    }
+
+    try {
+        if (banned) {
+            await auth.updateUser(uid, { disabled: true });
+            await auth.revokeRefreshTokens(uid);
+
+            await db.ref().update({
+                [`users/${uid}/globalBan`]: {
+                    active: true,
+                    reason: reason || "Conta bloqueada pela administração",
+                    bannedAt: Date.now()
+                },
+                [`sessions/${uid}`]: null
+            });
+
+            resetTransmitterIf(uid);
+
+            const ws = clients.get(uid);
+            if (ws && isOpen(ws)) {
+                sendJson(ws, {
+                    type: "session_revoked",
+                    reason: "Conta bloqueada pela administração do Z-Link Talk."
+                });
+
+                removeClientPresence(ws, "master_global_ban", false);
+
+                try {
+                    ws.close(4003, "Account banned");
+                } catch (_) {
+                    try { ws.terminate(); } catch (_) {}
+                }
+            }
+        } else {
+            await auth.updateUser(uid, { disabled: false });
+
+            const previous = await getGlobalBanInfo(uid);
+
+            await db.ref(`users/${uid}/globalBan`).set({
+                active: false,
+                reason: String(previous?.reason || ""),
+                bannedAt: Number(previous?.bannedAt || 0),
+                unbannedAt: Date.now()
+            });
+        }
+
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            userId: uid,
+            banned
+        });
+    } catch (error) {
+        console.error("[MASTER USER BAN]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: banned
+                ? "Não foi possível bloquear a conta"
+                : "Não foi possível desbloquear a conta"
+        });
+    }
+}
+
+async function handleMasterRenameChannel(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const name = String(body.name || "").trim();
+    const validation = validateUsername(name);
+
+    if (!isValidChannelId(channelId) || validation) {
+        sendHttpJson(res, 400, {
+            success: false,
+            error: validation || "Canal inválido"
+        });
+        return;
+    }
+
+    try {
+        const channelSnapshot = await db.ref(`channels/${channelId}`).get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal não encontrado" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const requestedKey = normalizeUsername(name);
+        const channelsSnapshot = await db.ref("channels").get();
+        let duplicate = false;
+
+        channelsSnapshot.forEach(child => {
+            if (String(child.key || "") === channelId) {
+                return false;
+            }
+
+            if (normalizeUsername(child.val()?.name) === requestedKey) {
+                duplicate = true;
+                return true;
+            }
+
+            return false;
+        });
+
+        if (duplicate) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Este nome de canal já está em uso"
+            });
+            return;
+        }
+
+        const updates = {
+            [`channels/${channelId}/name`]: name,
+            [`channels/${channelId}/updatedAt`]: Date.now()
+        };
+
+        if ((channel.type || "public") === "public") {
+            updates[`publicChannels/${channelId}/name`] = name;
+        }
+
+        await db.ref().update(updates);
+
+        for (const ws of clients.values()) {
+            const item = (ws.channels || []).find(entry =>
+                String(entry?.id || "") === channelId
+            );
+
+            if (!item) continue;
+
+            item.name = name;
+
+            if (isOpen(ws)) {
+                sendJson(ws, {
+                    type: "channel_profile_updated",
+                    channelId,
+                    name,
+                    description: String(item.description || "")
+                });
+
+                sendJson(ws, buildChannelStateMessage(ws));
+            }
+        }
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            name
+        });
+    } catch (error) {
+        console.error("[MASTER CHANNEL RENAME]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar o nome do canal"
+        });
+    }
+}
+
+async function handleMasterRemoveUserFromChannel(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const uid = String(body.userId || "").trim();
+
+    try {
+        const [channelSnapshot, profileSnapshot] = await Promise.all([
+            db.ref(`channels/${channelId}`).get(),
+            db.ref(`users/${uid}`).get()
+        ]);
+
+        if (!channelSnapshot.exists() || !profileSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal ou usuário não encontrado" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const profile = profileSnapshot.val() || {};
+
+        if (String(channel.ownerUid || "") === uid) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "Transfira a propriedade do canal antes de remover o proprietário"
+            });
+            return;
+        }
+
+        const updates = {
+            [`users/${uid}/channels/${channelId}`]: null,
+            [`channels/${channelId}/moderators/${uid}`]: null,
+            [`channels/${channelId}/admins/${uid}`]: null,
+            [`channels/${channelId}/trustedUsers/${uid}`]: null,
+            [`channels/${channelId}/blockedUsers/${uid}`]: null,
+            [`channels/${channelId}/updatedAt`]: Date.now()
+        };
+
+        if (String(profile.defaultChannelId || "") === channelId) {
+            updates[`users/${uid}/defaultChannelId`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        resetTransmitterIf(uid);
+
+        const targetWs = clients.get(uid);
+        if (targetWs && isOpen(targetWs)) {
+            sendJson(targetWs, {
+                type: "channel_disconnected",
+                channelId,
+                message: "Você foi removido deste canal pela administração."
+            });
+        }
+
+        await refreshConnectedClientChannels(uid);
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: uid
+        });
+    } catch (error) {
+        console.error("[MASTER CHANNEL REMOVE USER]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível remover o usuário do canal"
+        });
+    }
+}
+
+async function handleMasterChannelBlock(req, res, blocked) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const uid = String(body.userId || "").trim();
+
+    try {
+        const [channelSnapshot, profileSnapshot] = await Promise.all([
+            db.ref(`channels/${channelId}`).get(),
+            db.ref(`users/${uid}`).get()
+        ]);
+
+        if (!channelSnapshot.exists() || !profileSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal ou usuário não encontrado" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const profile = profileSnapshot.val() || {};
+
+        if (String(channel.ownerUid || "") === uid) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "O proprietário precisa ser transferido antes de ser bloqueado"
+            });
+            return;
+        }
+
+        const updates = {
+            [`channels/${channelId}/updatedAt`]: Date.now()
+        };
+
+        if (blocked) {
+            updates[`channels/${channelId}/blockedUsers/${uid}`] = {
+                blockedAt: Date.now(),
+                blockedBy: "MASTER_ADMIN"
+            };
+            updates[`channels/${channelId}/moderators/${uid}`] = null;
+            updates[`channels/${channelId}/admins/${uid}`] = null;
+            updates[`channels/${channelId}/trustedUsers/${uid}`] = null;
+            updates[`users/${uid}/channels/${channelId}/enabled`] = false;
+
+            if (String(profile.defaultChannelId || "") === channelId) {
+                updates[`users/${uid}/defaultChannelId`] = null;
+            }
+        } else {
+            updates[`channels/${channelId}/blockedUsers/${uid}`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        if (blocked) {
+            resetTransmitterIf(uid);
+        }
+
+        const refreshed = await db.ref(`channels/${channelId}`).get();
+        if (refreshed.exists()) {
+            updateInMemoryChannelAdmins(channelId, refreshed.val() || {});
+        }
+
+        const targetWs = clients.get(uid);
+        if (blocked && targetWs && isOpen(targetWs)) {
+            sendJson(targetWs, {
+                type: "channel_blocked",
+                channelId,
+                message: "Você foi bloqueado neste canal pela administração."
+            });
+        }
+
+        await refreshConnectedClientChannels(uid);
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: uid,
+            blocked
+        });
+    } catch (error) {
+        console.error("[MASTER CHANNEL BLOCK]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: blocked
+                ? "Não foi possível bloquear o usuário no canal"
+                : "Não foi possível desbloquear o usuário no canal"
+        });
+    }
+}
+
+async function handleMasterSetModerator(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const uid = String(body.userId || "").trim();
+    const moderator = body.moderator === true;
+
+    try {
+        const [channelSnapshot, membershipSnapshot] = await Promise.all([
+            db.ref(`channels/${channelId}`).get(),
+            db.ref(`users/${uid}/channels/${channelId}`).get()
+        ]);
+
+        if (!channelSnapshot.exists() || !membershipSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal ou participação não encontrada" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+
+        if (String(channel.ownerUid || "") === uid) {
+            sendHttpJson(res, 409, {
+                success: false,
+                error: "O proprietário já possui autoridade total no canal"
+            });
+            return;
+        }
+
+        const now = Date.now();
+        const updates = {
+            [`channels/${channelId}/updatedAt`]: now
+        };
+
+        if (moderator) {
+            updates[`channels/${channelId}/moderators/${uid}`] = {
+                promotedAt: now,
+                promotedBy: "MASTER_ADMIN"
+            };
+            updates[`channels/${channelId}/admins/${uid}`] = null;
+            updates[`channels/${channelId}/trustedUsers/${uid}`] = {
+                trustedAt: now,
+                trustedBy: "MASTER_ADMIN"
+            };
+            updates[`channels/${channelId}/blockedUsers/${uid}`] = null;
+            updates[`users/${uid}/channels/${channelId}/enabled`] = true;
+        } else {
+            updates[`channels/${channelId}/moderators/${uid}`] = null;
+            updates[`channels/${channelId}/admins/${uid}`] = null;
+        }
+
+        await db.ref().update(updates);
+
+        const refreshed = await db.ref(`channels/${channelId}`).get();
+        if (refreshed.exists()) {
+            updateInMemoryChannelAdmins(channelId, refreshed.val() || {});
+        }
+
+        await refreshConnectedClientChannels(uid);
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            userId: uid,
+            moderator
+        });
+    } catch (error) {
+        console.error("[MASTER SET MODERATOR]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível alterar a moderação"
+        });
+    }
+}
+
+async function handleMasterTransferOwner(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+    const newOwnerUid = String(body.userId || "").trim();
+    const keepOldAsModerator = body.keepOldAsModerator !== false;
+
+    try {
+        const [channelSnapshot, newOwnerProfileSnapshot] = await Promise.all([
+            db.ref(`channels/${channelId}`).get(),
+            db.ref(`users/${newOwnerUid}`).get()
+        ]);
+
+        if (!channelSnapshot.exists() || !newOwnerProfileSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal ou novo proprietário não encontrado" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const oldOwnerUid = String(channel.ownerUid || "");
+
+        if (!newOwnerUid || newOwnerUid === oldOwnerUid) {
+            sendHttpJson(res, 400, {
+                success: false,
+                error: "Escolha outro usuário para assumir o canal"
+            });
+            return;
+        }
+
+        const now = Date.now();
+        const updates = {
+            [`channels/${channelId}/ownerUid`]: newOwnerUid,
+            [`channels/${channelId}/updatedAt`]: now,
+            [`channels/${channelId}/moderators/${newOwnerUid}`]: null,
+            [`channels/${channelId}/admins/${newOwnerUid}`]: null,
+            [`channels/${channelId}/trustedUsers/${newOwnerUid}`]: null,
+            [`channels/${channelId}/blockedUsers/${newOwnerUid}`]: null,
+            [`users/${newOwnerUid}/channels/${channelId}/enabled`]: true,
+            [`users/${newOwnerUid}/channels/${channelId}/addedAt`]: now
+        };
+
+        if (oldOwnerUid) {
+            if (keepOldAsModerator) {
+                updates[`channels/${channelId}/moderators/${oldOwnerUid}`] = {
+                    promotedAt: now,
+                    promotedBy: "MASTER_ADMIN_TRANSFER"
+                };
+                updates[`channels/${channelId}/trustedUsers/${oldOwnerUid}`] = {
+                    trustedAt: now,
+                    trustedBy: "MASTER_ADMIN_TRANSFER"
+                };
+            } else {
+                updates[`channels/${channelId}/moderators/${oldOwnerUid}`] = null;
+                updates[`channels/${channelId}/admins/${oldOwnerUid}`] = null;
+                updates[`channels/${channelId}/trustedUsers/${oldOwnerUid}`] = null;
+            }
+        }
+
+        await db.ref().update(updates);
+
+        const refreshedSnapshot = await db.ref(`channels/${channelId}`).get();
+        const refreshedChannel = refreshedSnapshot.val() || {};
+        updateInMemoryChannelAdmins(channelId, refreshedChannel);
+
+        const active = activeTransmitters.get(channelId);
+        if (active) {
+            active.channelOwnerUid = newOwnerUid;
+        }
+
+        await refreshAllChannelParticipants(channelId);
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId,
+            previousOwnerUid: oldOwnerUid,
+            ownerUid: newOwnerUid,
+            previousOwnerIsModerator: keepOldAsModerator
+        });
+    } catch (error) {
+        console.error("[MASTER TRANSFER OWNER]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível transferir a propriedade do canal"
+        });
+    }
+}
+
+async function handleMasterDeleteChannel(req, res) {
+    try {
+        requireMasterAdminRequest(req);
+    } catch (error) {
+        sendMasterAuthError(res, error);
+        return;
+    }
+
+    let body;
+    try {
+        body = await readJsonBody(req);
+    } catch (error) {
+        sendHttpJson(res, 400, { success: false, error: error.message });
+        return;
+    }
+
+    const channelId = String(body.channelId || "").trim();
+
+    if (!isValidChannelId(channelId)) {
+        sendHttpJson(res, 400, { success: false, error: "Canal inválido" });
+        return;
+    }
+
+    try {
+        const channelSnapshot = await db.ref(`channels/${channelId}`).get();
+
+        if (!channelSnapshot.exists()) {
+            sendHttpJson(res, 404, { success: false, error: "Canal não encontrado" });
+            return;
+        }
+
+        const channel = channelSnapshot.val() || {};
+        const active = activeTransmitters.get(channelId);
+
+        if (active) {
+            resetTransmitterIf(active.userId);
+        }
+
+        const usersSnapshot = await db.ref("users").get();
+        const allUsers = usersSnapshot.exists()
+            ? usersSnapshot.val() || {}
+            : {};
+
+        const updates = {
+            [`channels/${channelId}`]: null,
+            [`publicChannels/${channelId}`]: null
+        };
+        const affected = [];
+        const removedAt = Date.now();
+
+        for (const [uid, profileValue] of Object.entries(allUsers)) {
+            const profile = profileValue || {};
+            const membership = profile.channels?.[channelId];
+
+            if (membership) {
+                updates[`users/${uid}/channels/${channelId}`] =
+                    buildRemovedChannelMembership(
+                        membership,
+                        channel,
+                        "master_deleted",
+                        removedAt
+                    );
+                affected.push(uid);
+            }
+
+            if (String(profile.defaultChannelId || "") === channelId) {
+                updates[`users/${uid}/defaultChannelId`] = null;
+            }
+        }
+
+        await db.ref().update(updates);
+
+        for (const uid of affected) {
+            sendChannelRemovedEvent(
+                uid,
+                channelId,
+                channel,
+                "master_deleted"
+            );
+            await refreshConnectedClientChannels(uid);
+        }
+
+        broadcastUserLists();
+
+        sendHttpJson(res, 200, {
+            success: true,
+            channelId
+        });
+    } catch (error) {
+        console.error("[MASTER DELETE CHANNEL]", error?.stack || error?.message || error);
+        sendHttpJson(res, 500, {
+            success: false,
+            error: "Não foi possível excluir o canal"
+        });
+    }
+}
+
+function sendMasterMonitorJson(ws, data) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+
+    try {
+        ws.send(JSON.stringify(data));
+    } catch (_) {
+    }
+}
+
+function sendMasterMonitorTxStart(ws, channelId, state) {
+    if (!state) return;
+
+    const txKey =
+        `${channelId}:${state.userId}:${Number(state.startedAt || 0)}`;
+
+    ws.masterMonitorTxKey = txKey;
+
+    sendMasterMonitorJson(ws, {
+        type: "admin_monitor_tx_start",
+        channelId,
+        userId: String(state.userId || ""),
+        name: String(state.name || state.userId || "Usuário"),
+        startedAt: Number(state.startedAt || Date.now()),
+        assistantGenerated: state.assistantGenerated === true
+    });
+}
+
+function notifyMasterMonitorsTxStop(channelId, state) {
+    for (const monitor of masterAdminMonitors) {
+        if (
+            monitor.readyState !== WebSocket.OPEN ||
+            String(monitor.masterMonitorChannelId || "") !== String(channelId)
+        ) {
+            continue;
+        }
+
+        sendMasterMonitorJson(monitor, {
+            type: "admin_monitor_tx_stop",
+            channelId,
+            userId: String(state?.userId || ""),
+            name: String(state?.name || state?.userId || "Usuário"),
+            stoppedAt: Date.now()
+        });
+
+        monitor.masterMonitorTxKey = null;
+    }
+}
+
+async function handleMasterMonitorJson(ws, data) {
+    if (data.type === "admin_monitor_identify") {
+        const token = String(data.adminToken || "").trim();
+
+        if (!MASTER_ADMIN_TOKEN) {
+            sendMasterMonitorJson(ws, {
+                type: "admin_monitor_denied",
+                message: "ZLINK_MASTER_ADMIN_TOKEN não foi configurado no servidor."
+            });
+            try { ws.close(4003, "Master admin not configured"); } catch (_) {}
+            return true;
+        }
+
+        if (!masterTokenMatches(token)) {
+            sendMasterMonitorJson(ws, {
+                type: "admin_monitor_denied",
+                message: "Token mestre inválido."
+            });
+            try { ws.close(4003, "Master admin denied"); } catch (_) {}
+            return true;
+        }
+
+        ws.isMasterAdminMonitor = true;
+        ws.masterMonitorChannelId = null;
+        ws.masterMonitorTxKey = null;
+        masterAdminMonitors.add(ws);
+
+        sendMasterMonitorJson(ws, {
+            type: "admin_monitor_ready",
+            timestamp: Date.now()
+        });
+
+        return true;
+    }
+
+    if (!ws.isMasterAdminMonitor) {
+        return false;
+    }
+
+    if (data.type === "admin_monitor_select") {
+        const channelId = String(data.channelId || "").trim();
+        const snapshot = await db.ref(`channels/${channelId}`).get();
+
+        if (!snapshot.exists()) {
+            sendMasterMonitorJson(ws, {
+                type: "admin_monitor_error",
+                message: "Canal não encontrado"
+            });
+            return true;
+        }
+
+        ws.masterMonitorChannelId = channelId;
+        ws.masterMonitorTxKey = null;
+
+        sendMasterMonitorJson(ws, {
+            type: "admin_monitor_selected",
+            channelId,
+            name: String(snapshot.val()?.name || "Canal")
+        });
+
+        const state = activeTransmitters.get(channelId);
+        if (state) {
+            sendMasterMonitorTxStart(ws, channelId, state);
+
+            if (Array.isArray(state.bootstrapPackets)) {
+                for (const packet of state.bootstrapPackets) {
+                    if (ws.readyState !== WebSocket.OPEN) break;
+                    try {
+                        ws.send(packet, { binary: true });
+                    } catch (_) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    if (data.type === "admin_monitor_stop") {
+        ws.masterMonitorChannelId = null;
+        ws.masterMonitorTxKey = null;
+
+        sendMasterMonitorJson(ws, {
+            type: "admin_monitor_stopped"
+        });
+
+        return true;
+    }
+
+    if (data.type === "admin_monitor_ping") {
+        sendMasterMonitorJson(ws, {
+            type: "admin_monitor_pong",
+            timestamp: Date.now()
+        });
+        return true;
+    }
+
+    return true;
+}
+
+
+// ============================================================
 // HTTP SERVER
 // ============================================================
 
@@ -6782,6 +8071,98 @@ const httpServer =
 
                 res.end();
 
+                return;
+            }
+
+            // ------------------------------------------------
+            // MASTER ADMIN PANEL
+            // ------------------------------------------------
+
+            if (
+                req.method === "GET" &&
+                req.url.split("?")[0] === "/api/master/overview"
+            ) {
+                await handleMasterOverview(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/users/rename"
+            ) {
+                await handleMasterRenameUser(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/users/ban"
+            ) {
+                await handleMasterBanUser(req, res, true);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/users/unban"
+            ) {
+                await handleMasterBanUser(req, res, false);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/rename"
+            ) {
+                await handleMasterRenameChannel(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/remove-user"
+            ) {
+                await handleMasterRemoveUserFromChannel(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/block-user"
+            ) {
+                await handleMasterChannelBlock(req, res, true);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/unblock-user"
+            ) {
+                await handleMasterChannelBlock(req, res, false);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/set-moderator"
+            ) {
+                await handleMasterSetModerator(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/transfer-owner"
+            ) {
+                await handleMasterTransferOwner(req, res);
+                return;
+            }
+
+            if (
+                req.method === "POST" &&
+                req.url === "/api/master/channels/delete"
+            ) {
+                await handleMasterDeleteChannel(req, res);
                 return;
             }
 
@@ -8613,6 +9994,11 @@ function resetTransmitterIf(
             assistantReason
         );
 
+        notifyMasterMonitorsTxStop(
+            channelId,
+            state
+        );
+
         activeTransmitters.delete(channelId);
         stopped.push({ channelId, state });
 
@@ -8765,6 +10151,26 @@ async function handleJson(
         return;
     }
 
+    /*
+     * O painel mestre usa um fluxo WebSocket separado do login do app.
+     * Depois de identificado como monitor mestre, nenhuma mensagem é tratada
+     * pelas rotas normais de usuário.
+     */
+    if (
+        data.type === "admin_monitor_identify" ||
+        ws.isMasterAdminMonitor
+    ) {
+        const handled =
+            await handleMasterMonitorJson(
+                ws,
+                data
+            );
+
+        if (handled) {
+            return;
+        }
+    }
+
     // ========================================================
     // IDENTIFY
     // ========================================================
@@ -8820,7 +10226,7 @@ async function handleJson(
         try {
 
             decoded =
-                await auth.verifyIdToken(
+                await verifyUserIdTokenStrict(
                     token
                 );
 
@@ -10260,6 +11666,15 @@ wss.on(
             "[WS] Cliente conectado"
         );
 
+        ws.isMasterAdminMonitor =
+            false;
+
+        ws.masterMonitorChannelId =
+            null;
+
+        ws.masterMonitorTxKey =
+            null;
+
         ws.userId =
             null;
 
@@ -10428,6 +11843,40 @@ wss.on(
                         }
                     }
 
+                    /*
+                     * Painel mestre: recebe somente o canal que foi
+                     * explicitamente selecionado no monitor. Ele não altera
+                     * presença, RX/TX ou arbitragem dos usuários normais.
+                     */
+                    for (const monitor of masterAdminMonitors) {
+                        if (
+                            monitor.readyState !== WebSocket.OPEN ||
+                            String(monitor.masterMonitorChannelId || "") !==
+                                String(channelId)
+                        ) {
+                            continue;
+                        }
+
+                        const txKey =
+                            `${channelId}:${txState.userId}:${Number(txState.startedAt || 0)}`;
+
+                        if (monitor.masterMonitorTxKey !== txKey) {
+                            sendMasterMonitorTxStart(
+                                monitor,
+                                channelId,
+                                txState
+                            );
+                        }
+
+                        try {
+                            monitor.send(
+                                data,
+                                { binary: true }
+                            );
+                        } catch (_) {
+                        }
+                    }
+
                     if (
                         txState.audioPacketCount === 1 ||
                         txState.audioPacketCount % 100 === 0
@@ -10512,6 +11961,12 @@ wss.on(
                 );
 
                 clearReceiveSelectionTimer(ws);
+
+                if (ws.isMasterAdminMonitor) {
+                    masterAdminMonitors.delete(ws);
+                    ws.masterMonitorChannelId = null;
+                    ws.masterMonitorTxKey = null;
+                }
 
                 removeClientPresence(
                     ws,
