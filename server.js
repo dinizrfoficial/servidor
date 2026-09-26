@@ -8368,11 +8368,288 @@ function sendMasterMonitorTxStart(ws, channelId, state) {
     sendMasterMonitorJson(ws, {
         type: "admin_monitor_tx_start",
         channelId,
+        channelName: String(
+            state.channelName ||
+            channelId ||
+            "Canal"
+        ),
         userId: String(state.userId || ""),
         name: String(state.name || state.userId || "Usuário"),
         startedAt: Number(state.startedAt || Date.now()),
         assistantGenerated: state.assistantGenerated === true
     });
+}
+
+function feedMasterMonitorBootstrap(
+    ws,
+    state
+) {
+    if (
+        !state ||
+        !Array.isArray(
+            state.bootstrapPackets
+        )
+    ) {
+        return;
+    }
+
+    for (
+        const packet of
+        state.bootstrapPackets
+    ) {
+        if (
+            ws.readyState !==
+            WebSocket.OPEN
+        ) {
+            break;
+        }
+
+        try {
+            feedMasterMonitorAudioPacket(
+                ws,
+                packet
+            );
+        } catch (_) {
+            break;
+        }
+    }
+}
+
+function oldestActiveMasterMonitorTransmission() {
+    let selectedChannelId =
+        null;
+
+    let selectedState =
+        null;
+
+    for (
+        const [channelId, state] of
+        activeTransmitters
+    ) {
+        if (!state) {
+            continue;
+        }
+
+        if (!selectedState) {
+            selectedChannelId =
+                channelId;
+
+            selectedState =
+                state;
+
+            continue;
+        }
+
+        const currentStartedAt =
+            Number(
+                state.startedAt ||
+                Number.MAX_SAFE_INTEGER
+            );
+
+        const selectedStartedAt =
+            Number(
+                selectedState.startedAt ||
+                Number.MAX_SAFE_INTEGER
+            );
+
+        if (
+            currentStartedAt <
+                selectedStartedAt ||
+            (
+                currentStartedAt ===
+                    selectedStartedAt &&
+                String(channelId) <
+                    String(selectedChannelId)
+            )
+        ) {
+            selectedChannelId =
+                channelId;
+
+            selectedState =
+                state;
+        }
+    }
+
+    if (!selectedState) {
+        return null;
+    }
+
+    return {
+        channelId:
+            String(
+                selectedChannelId
+            ),
+        state:
+            selectedState
+    };
+}
+
+/*
+ * Seleciona o canal que o monitor global vai ouvir.
+ *
+ * Regra:
+ * - se nenhum canal está sendo ouvido, pega o TX mais antigo já ativo;
+ * - enquanto esse canal estiver falando, não troca para outro;
+ * - quando ele terminar, esta função é chamada novamente e escolhe o
+ *   próximo TX mais antigo que ainda estiver ativo.
+ */
+function selectMasterMonitorAllChannel(
+    ws,
+    preferredChannelId = null,
+    preferredState = null
+) {
+    if (
+        !ws ||
+        ws.readyState !==
+            WebSocket.OPEN ||
+        ws.masterMonitorMode !==
+            "all"
+    ) {
+        return false;
+    }
+
+    let channelId =
+        preferredChannelId
+            ? String(
+                preferredChannelId
+            )
+            : "";
+
+    let state =
+        preferredState ||
+        (
+            channelId
+                ? activeTransmitters.get(
+                    channelId
+                )
+                : null
+        );
+
+    if (
+        !channelId ||
+        !state ||
+        activeTransmitters.get(
+            channelId
+        ) !==
+            state
+    ) {
+        const selected =
+            oldestActiveMasterMonitorTransmission();
+
+        if (!selected) {
+            stopMasterMonitorTranscoder(
+                ws,
+                "all-waiting"
+            );
+
+            ws.masterMonitorChannelId =
+                null;
+
+            ws.masterMonitorTxKey =
+                null;
+
+            sendMasterMonitorJson(
+                ws,
+                {
+                    type:
+                        "admin_monitor_all_waiting"
+                }
+            );
+
+            return false;
+        }
+
+        channelId =
+            selected.channelId;
+
+        state =
+            selected.state;
+    }
+
+    stopMasterMonitorTranscoder(
+        ws,
+        "all-channel-select"
+    );
+
+    ws.masterMonitorChannelId =
+        channelId;
+
+    ws.masterMonitorTxKey =
+        null;
+
+    sendMasterMonitorJson(
+        ws,
+        {
+            type:
+                "admin_monitor_all_channel",
+            channelId,
+            channelName:
+                String(
+                    state.channelName ||
+                    channelId ||
+                    "Canal"
+                ),
+            userId:
+                String(
+                    state.userId ||
+                    ""
+                ),
+            name:
+                String(
+                    state.name ||
+                    state.userId ||
+                    "Usuário"
+                ),
+            startedAt:
+                Number(
+                    state.startedAt ||
+                    Date.now()
+                )
+        }
+    );
+
+    sendMasterMonitorTxStart(
+        ws,
+        channelId,
+        state
+    );
+
+    feedMasterMonitorBootstrap(
+        ws,
+        state
+    );
+
+    return true;
+}
+
+function notifyMasterMonitorAllTxStart(
+    channelId,
+    state
+) {
+    for (
+        const monitor of
+        masterAdminMonitors
+    ) {
+        if (
+            monitor.readyState !==
+                WebSocket.OPEN ||
+            monitor.masterMonitorMode !==
+                "all" ||
+            monitor.masterMonitorChannelId
+        ) {
+            continue;
+        }
+
+        /*
+         * Não existe canal sendo ouvido neste instante. O primeiro
+         * start_tx que chegar passa a ser o dono da escuta global.
+         */
+        selectMasterMonitorAllChannel(
+            monitor,
+            channelId,
+            state
+        );
+    }
 }
 
 function notifyMasterMonitorsTxStop(channelId, state) {
@@ -8387,6 +8664,11 @@ function notifyMasterMonitorsTxStop(channelId, state) {
         sendMasterMonitorJson(monitor, {
             type: "admin_monitor_tx_stop",
             channelId,
+            channelName: String(
+                state?.channelName ||
+                channelId ||
+                "Canal"
+            ),
             userId: String(state?.userId || ""),
             name: String(state?.name || state?.userId || "Usuário"),
             stoppedAt: Date.now()
@@ -8398,6 +8680,22 @@ function notifyMasterMonitorsTxStop(channelId, state) {
             monitor,
             "tx-stop"
         );
+
+        if (
+            monitor.masterMonitorMode ===
+                "all"
+        ) {
+            /*
+             * No monitor global o canal terminou. Libera a seleção e,
+             * imediatamente, verifica se outro canal já está transmitindo.
+             */
+            monitor.masterMonitorChannelId =
+                null;
+
+            selectMasterMonitorAllChannel(
+                monitor
+            );
+        }
     }
 }
 
@@ -8424,6 +8722,7 @@ async function handleMasterMonitorJson(ws, data) {
         }
 
         ws.isMasterAdminMonitor = true;
+        ws.masterMonitorMode = "none";
         ws.masterMonitorChannelId = null;
         ws.masterMonitorTxKey = null;
         ws.masterMonitorTranscoder = null;
@@ -8459,6 +8758,7 @@ async function handleMasterMonitorJson(ws, data) {
             "channel-select"
         );
 
+        ws.masterMonitorMode = "channel";
         ws.masterMonitorChannelId = channelId;
         ws.masterMonitorTxKey = null;
 
@@ -8472,20 +8772,46 @@ async function handleMasterMonitorJson(ws, data) {
         if (state) {
             sendMasterMonitorTxStart(ws, channelId, state);
 
-            if (Array.isArray(state.bootstrapPackets)) {
-                for (const packet of state.bootstrapPackets) {
-                    if (ws.readyState !== WebSocket.OPEN) break;
-                    try {
-                        feedMasterMonitorAudioPacket(
-                            ws,
-                            packet
-                        );
-                    } catch (_) {
-                        break;
-                    }
-                }
-            }
+            feedMasterMonitorBootstrap(
+                ws,
+                state
+            );
         }
+
+        return true;
+    }
+
+    if (
+        data.type ===
+        "admin_monitor_all_start"
+    ) {
+        stopMasterMonitorTranscoder(
+            ws,
+            "all-start"
+        );
+
+        ws.masterMonitorMode =
+            "all";
+
+        ws.masterMonitorChannelId =
+            null;
+
+        ws.masterMonitorTxKey =
+            null;
+
+        sendMasterMonitorJson(
+            ws,
+            {
+                type:
+                    "admin_monitor_all_started",
+                timestamp:
+                    Date.now()
+            }
+        );
+
+        selectMasterMonitorAllChannel(
+            ws
+        );
 
         return true;
     }
@@ -8496,6 +8822,7 @@ async function handleMasterMonitorJson(ws, data) {
             "monitor-stop"
         );
 
+        ws.masterMonitorMode = "none";
         ws.masterMonitorChannelId = null;
         ws.masterMonitorTxKey = null;
 
@@ -10467,12 +10794,19 @@ function resetTransmitterIf(
             assistantReason
         );
 
+        /*
+         * Remove primeiro do mapa. Assim o monitor global, ao receber o
+         * stop, não pode selecionar novamente o mesmo TX como "próximo".
+         */
+        activeTransmitters.delete(
+            channelId
+        );
+
         notifyMasterMonitorsTxStop(
             channelId,
             state
         );
 
-        activeTransmitters.delete(channelId);
         stopped.push({ channelId, state });
 
         console.log(
@@ -11599,6 +11933,11 @@ async function handleJson(
             userId: ws.userId,
             name: ws.name,
             avatar: ws.avatar || "",
+            channelName: String(
+                channelMetadata?.name ||
+                channelId ||
+                "Canal"
+            ),
             channelOwnerUid: String(channelMetadata?.ownerUid || ""),
             startedAt: txStartedAt,
 
@@ -11627,6 +11966,11 @@ async function handleJson(
         );
 
         notifyAssistantOwnerTxStart(
+            channelId,
+            state
+        );
+
+        notifyMasterMonitorAllTxStart(
             channelId,
             state
         );
@@ -11941,6 +12285,11 @@ async function handleJson(
             name: "Assistente",
             assistantName,
             avatar: assistantAvatar,
+            channelName: String(
+                channel?.name ||
+                channelId ||
+                "Canal"
+            ),
             channelOwnerUid: String(channel?.ownerUid || ws.userId || ""),
             startedAt: txStartedAt,
             lastAudioAt: txStartedAt,
@@ -11955,6 +12304,11 @@ async function handleJson(
         };
 
         activeTransmitters.set(
+            channelId,
+            state
+        );
+
+        notifyMasterMonitorAllTxStart(
             channelId,
             state
         );
@@ -12172,6 +12526,9 @@ wss.on(
 
         ws.isMasterAdminMonitor =
             false;
+
+        ws.masterMonitorMode =
+            "none";
 
         ws.masterMonitorChannelId =
             null;
@@ -12479,6 +12836,7 @@ wss.on(
                     );
 
                     masterAdminMonitors.delete(ws);
+                    ws.masterMonitorMode = "none";
                     ws.masterMonitorChannelId = null;
                     ws.masterMonitorTxKey = null;
                 }
