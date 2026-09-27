@@ -369,6 +369,21 @@ function startMasterMonitorTranscoder(
                 return;
             }
 
+            /*
+             * O painel mestre nunca pode pressionar o caminho celular ->
+             * celular. Se o navegador estiver atrasado, descartamos somente
+             * PCM de monitoramento em vez de acumular segundos de áudio no
+             * WebSocket do painel e provocar GC/jitter no processo inteiro.
+             */
+            if (
+                Number(ws.bufferedAmount || 0) >
+                    MAX_MASTER_PCM_BUFFERED_BYTES
+            ) {
+                ws.masterMonitorDroppedPcmChunks =
+                    Number(ws.masterMonitorDroppedPcmChunks || 0) + 1;
+                return;
+            }
+
             try {
                 ws.send(
                     Buffer.concat(
@@ -574,6 +589,20 @@ function feedMasterMonitorAudioPacket(
             AUDIO_HEADER_SIZE
         );
 
+    /*
+     * O transcodificador existe apenas para o painel mestre. Não deixamos a
+     * fila do stdin crescer sem limite caso o FFmpeg esteja temporariamente
+     * mais lento que o fluxo recebido.
+     */
+    if (
+        Number(child.stdin.writableLength || 0) >
+            MAX_MASTER_FFMPEG_STDIN_BYTES
+    ) {
+        ws.masterMonitorDroppedAmrFrames =
+            Number(ws.masterMonitorDroppedAmrFrames || 0) + 1;
+        return;
+    }
+
     try {
         child.stdin.write(
             amrFrame
@@ -623,6 +652,58 @@ const AUDIO_VERSION =
 
 const AUDIO_HEADER_SIZE =
     6;
+
+/*
+ * Proteções do caminho crítico de áudio.
+ *
+ * O áudio PTT é tráfego em tempo real: uma fila WebSocket muito grande não
+ * ajuda o ouvinte, apenas transforma áudio atual em áudio atrasado e aumenta
+ * uso de memória/GC do processo. Em situação normal bufferedAmount fica perto
+ * de zero; estes limites atuam somente quando um destino realmente congestionou.
+ */
+function positiveIntegerEnv(
+    name,
+    fallback,
+    minimum
+) {
+    const value =
+        Number(process.env[name]);
+
+    if (
+        !Number.isFinite(value) ||
+        value < minimum
+    ) {
+        return fallback;
+    }
+
+    return Math.floor(value);
+}
+
+const MAX_AUDIO_BUFFERED_BYTES =
+    positiveIntegerEnv(
+        "ZLINK_MAX_AUDIO_BUFFERED_BYTES",
+        24 * 1024,
+        8 * 1024
+    );
+
+const MAX_MASTER_PCM_BUFFERED_BYTES =
+    positiveIntegerEnv(
+        "ZLINK_MAX_MASTER_PCM_BUFFERED_BYTES",
+        512 * 1024,
+        64 * 1024
+    );
+
+const MAX_MASTER_FFMPEG_STDIN_BYTES =
+    positiveIntegerEnv(
+        "ZLINK_MAX_MASTER_FFMPEG_STDIN_BYTES",
+        256 * 1024,
+        32 * 1024
+    );
+
+const AUDIO_PACKET_DEBUG =
+    String(process.env.ZLINK_AUDIO_PACKET_DEBUG || "")
+        .trim()
+        .toLowerCase() === "true";
 
 /*
  * Quantidade de pacotes iniciais preservados de cada transmissão.
@@ -9502,6 +9583,14 @@ const wss =
         server:
             httpServer,
 
+        /*
+         * Áudio AMR-WB já é comprimido. Compressão WebSocket só acrescentaria
+         * CPU/latência. O ws já desativa isto por padrão no servidor; deixamos
+         * explícito para impedir regressão por configuração futura.
+         */
+        perMessageDeflate:
+            false,
+
         maxPayload:
             64 * 1024
     });
@@ -12806,7 +12895,22 @@ function removeClientPresence(
 
 wss.on(
     "connection",
-    ws => {
+    (
+        ws,
+        request
+    ) => {
+
+        /*
+         * PTT favorece latência, não throughput em blocos grandes. Desabilitar
+         * Nagle evita que pequenos frames aguardem agrupamento TCP. O keepalive
+         * ajuda o SO a detectar conexões quebradas sem interferir no heartbeat
+         * WebSocket da aplicação.
+         */
+        try {
+            request?.socket?.setNoDelay(true);
+            request?.socket?.setKeepAlive(true, 15_000);
+        } catch (_) {
+        }
 
         console.log(
             "[WS] Cliente conectado"
@@ -12890,6 +12994,18 @@ wss.on(
         ws.lastSeenAt =
             Date.now();
 
+        ws.audioBackpressureDrops =
+            0;
+
+        ws.audioBackpressureLastLogAt =
+            0;
+
+        ws.masterMonitorDroppedPcmChunks =
+            0;
+
+        ws.masterMonitorDroppedAmrFrames =
+            0;
+
         ws.on(
             "pong",
             () => {
@@ -12904,7 +13020,7 @@ wss.on(
 
         ws.on(
             "message",
-            async (
+            (
                 data,
                 isBinary
             ) => {
@@ -12972,35 +13088,75 @@ wss.on(
                     }
 
                     let delivered = 0;
+                    let backpressured = 0;
 
                     for (const client of clients.values()) {
+                        /*
+                         * FAST PATH DO ÁUDIO
+                         *
+                         * rxChannelId só é atribuído depois das regras de
+                         * participação, bloqueio, canal privado e confiança
+                         * terem sido validadas. refreshConnectedClientChannels
+                         * remove a seleção imediatamente quando a permissão muda.
+                         * Portanto não repetimos buscas/Set a cada frame de 20 ms.
+                         */
                         if (
-                            canClientReceiveFromChannel(
-                                client,
-                                channelId
-                            ) &&
-                            client.rxChannelId === channelId &&
-                            !client.txChannelId &&
-                            client.userId !== ws.userId
+                            !isOpen(client) ||
+                            client.rxChannelId !== channelId ||
+                            client.txChannelId ||
+                            client.userId === ws.userId
                         ) {
-                            try {
-                                client.send(
-                                    data,
-                                    {
-                                        binary: true
-                                    }
-                                );
+                            continue;
+                        }
 
-                                delivered++;
+                        /*
+                         * Um receptor com rede ruim não pode acumular uma fila
+                         * enorme e aumentar memória/GC para todos. Em condições
+                         * normais bufferedAmount fica próximo de zero.
+                         */
+                        if (
+                            Number(client.bufferedAmount || 0) >
+                                MAX_AUDIO_BUFFERED_BYTES
+                        ) {
+                            client.audioBackpressureDrops =
+                                Number(client.audioBackpressureDrops || 0) + 1;
+                            backpressured++;
 
-                            } catch (error) {
-                                console.error(
-                                    `[AUDIO TX ERROR] ` +
+                            const now = Date.now();
+                            if (
+                                now - Number(client.audioBackpressureLastLogAt || 0) >=
+                                    5_000
+                            ) {
+                                client.audioBackpressureLastLogAt = now;
+                                console.warn(
+                                    `[AUDIO BACKPRESSURE] ` +
+                                    `listener=${client.userId} ` +
                                     `channel=${channelId} ` +
-                                    `para=${client.userId} ` +
-                                    `${error.message}`
+                                    `buffered=${client.bufferedAmount} ` +
+                                    `drops=${client.audioBackpressureDrops}`
                                 );
                             }
+
+                            continue;
+                        }
+
+                        try {
+                            client.send(
+                                data,
+                                {
+                                    binary: true
+                                }
+                            );
+
+                            delivered++;
+
+                        } catch (error) {
+                            console.error(
+                                `[AUDIO TX ERROR] ` +
+                                `channel=${channelId} ` +
+                                `para=${client.userId} ` +
+                                `${error.message}`
+                            );
                         }
                     }
 
@@ -13039,10 +13195,13 @@ wss.on(
                     }
 
                     if (
-                        txState.audioPacketCount === 1 ||
-                        txState.audioPacketCount % 100 === 0
+                        AUDIO_PACKET_DEBUG &&
+                        (
+                            txState.audioPacketCount === 1 ||
+                            txState.audioPacketCount % 250 === 0
+                        )
                     ) {
-                        const opusSize =
+                        const codecPayloadSize =
                             data.length - AUDIO_HEADER_SIZE;
 
                         console.log(
@@ -13050,8 +13209,9 @@ wss.on(
                             `de=${ws.userId} ` +
                             `channel=${channelId} ` +
                             `bytes=${data.length} ` +
-                            `opus=${opusSize} ` +
-                            `destinatarios=${delivered}`
+                            `payload=${codecPayloadSize} ` +
+                            `destinatarios=${delivered} ` +
+                            `backpressure=${backpressured}`
                         );
                     }
 
@@ -13096,9 +13256,19 @@ wss.on(
                     return;
                 }
 
-                await handleJson(
-                    ws,
-                    message
+                Promise.resolve(
+                    handleJson(
+                        ws,
+                        message
+                    )
+                ).catch(
+                    error => {
+                        console.error(
+                            `[JSON HANDLE ERROR] ` +
+                            `${ws.userId || "não identificado"}: ` +
+                            `${error?.stack || error?.message || error}`
+                        );
+                    }
                 );
             }
         );
@@ -13373,10 +13543,23 @@ setInterval(
     () => {
         let packetCount = 0;
         let byteCount = 0;
+        let backpressureDrops = 0;
+        let maxBufferedAmount = 0;
 
         for (const state of activeTransmitters.values()) {
             packetCount += Number(state.audioPacketCount || 0);
             byteCount += Number(state.audioBytesRelayed || 0);
+        }
+
+        for (const client of clients.values()) {
+            backpressureDrops +=
+                Number(client.audioBackpressureDrops || 0);
+
+            maxBufferedAmount =
+                Math.max(
+                    maxBufferedAmount,
+                    Number(client.bufferedAmount || 0)
+                );
         }
 
         if (packetCount > 0) {
@@ -13384,7 +13567,9 @@ setInterval(
                 `[AUDIO STATS] ` +
                 `canaisAtivos=${activeTransmitters.size} ` +
                 `pacotes=${packetCount} ` +
-                `bytes=${byteCount}`
+                `bytes=${byteCount} ` +
+                `backpressureDrops=${backpressureDrops} ` +
+                `maxBuffered=${maxBufferedAmount}`
             );
         }
     },
