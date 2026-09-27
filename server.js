@@ -296,6 +296,8 @@ function startMasterMonitorTranscoder(
                     "-hide_banner",
                     "-loglevel",
                     "error",
+                    "-threads",
+                    "1",
 
                     /*
                      * O cabeçalho AMR-WB é escrito no stdin logo após o spawn.
@@ -370,17 +372,10 @@ function startMasterMonitorTranscoder(
             }
 
             /*
-             * O painel mestre nunca pode pressionar o caminho celular ->
-             * celular. Se o navegador estiver atrasado, descartamos somente
-             * PCM de monitoramento em vez de acumular segundos de áudio no
-             * WebSocket do painel e provocar GC/jitter no processo inteiro.
+             * O painel mestre é auxiliar. Se o navegador estiver lento,
+             * nunca permitimos que seu PCM crie uma fila grande no servidor.
              */
-            if (
-                Number(ws.bufferedAmount || 0) >
-                    MAX_MASTER_PCM_BUFFERED_BYTES
-            ) {
-                ws.masterMonitorDroppedPcmChunks =
-                    Number(ws.masterMonitorDroppedPcmChunks || 0) + 1;
+            if (Number(ws.bufferedAmount || 0) >= 512 * 1024) {
                 return;
             }
 
@@ -393,7 +388,8 @@ function startMasterMonitorTranscoder(
                         ]
                     ),
                     {
-                        binary: true
+                        binary: true,
+                        compress: false
                     }
                 );
             } catch (_) {
@@ -590,16 +586,11 @@ function feedMasterMonitorAudioPacket(
         );
 
     /*
-     * O transcodificador existe apenas para o painel mestre. Não deixamos a
-     * fila do stdin crescer sem limite caso o FFmpeg esteja temporariamente
-     * mais lento que o fluxo recebido.
+     * Se o FFmpeg/painel não acompanhar em tempo real, descartamos somente
+     * áudio do monitor administrativo. O relay entre celulares nunca espera
+     * por este transcoder.
      */
-    if (
-        Number(child.stdin.writableLength || 0) >
-            MAX_MASTER_FFMPEG_STDIN_BYTES
-    ) {
-        ws.masterMonitorDroppedAmrFrames =
-            Number(ws.masterMonitorDroppedAmrFrames || 0) + 1;
+    if (Number(child.stdin.writableLength || 0) >= 64 * 1024) {
         return;
     }
 
@@ -652,58 +643,6 @@ const AUDIO_VERSION =
 
 const AUDIO_HEADER_SIZE =
     6;
-
-/*
- * Proteções do caminho crítico de áudio.
- *
- * O áudio PTT é tráfego em tempo real: uma fila WebSocket muito grande não
- * ajuda o ouvinte, apenas transforma áudio atual em áudio atrasado e aumenta
- * uso de memória/GC do processo. Em situação normal bufferedAmount fica perto
- * de zero; estes limites atuam somente quando um destino realmente congestionou.
- */
-function positiveIntegerEnv(
-    name,
-    fallback,
-    minimum
-) {
-    const value =
-        Number(process.env[name]);
-
-    if (
-        !Number.isFinite(value) ||
-        value < minimum
-    ) {
-        return fallback;
-    }
-
-    return Math.floor(value);
-}
-
-const MAX_AUDIO_BUFFERED_BYTES =
-    positiveIntegerEnv(
-        "ZLINK_MAX_AUDIO_BUFFERED_BYTES",
-        24 * 1024,
-        8 * 1024
-    );
-
-const MAX_MASTER_PCM_BUFFERED_BYTES =
-    positiveIntegerEnv(
-        "ZLINK_MAX_MASTER_PCM_BUFFERED_BYTES",
-        512 * 1024,
-        64 * 1024
-    );
-
-const MAX_MASTER_FFMPEG_STDIN_BYTES =
-    positiveIntegerEnv(
-        "ZLINK_MAX_MASTER_FFMPEG_STDIN_BYTES",
-        256 * 1024,
-        32 * 1024
-    );
-
-const AUDIO_PACKET_DEBUG =
-    String(process.env.ZLINK_AUDIO_PACKET_DEBUG || "")
-        .trim()
-        .toLowerCase() === "true";
 
 /*
  * Quantidade de pacotes iniciais preservados de cada transmissão.
@@ -1279,6 +1218,64 @@ async function loadClientChannelState(uid) {
     };
 }
 
+function rebuildClientChannelCaches(ws) {
+    if (!ws) {
+        return;
+    }
+
+    const channelById = new Map();
+    const trustedChannelIds = new Set();
+    const receiveChannelIds = new Set();
+    const transmitChannelIds = new Set();
+
+    const uid = String(ws.userId || "");
+    const enabled = ws.enabledChannelIds || new Set();
+
+    for (const channel of (Array.isArray(ws.channels) ? ws.channels : [])) {
+        const channelId = String(channel?.id || "");
+
+        if (!channelId) {
+            continue;
+        }
+
+        channelById.set(channelId, channel);
+
+        const ownerUid = String(channel?.ownerUid || "");
+        const moderatorSource = Array.isArray(channel?.moderatorUids)
+            ? channel.moderatorUids
+            : (Array.isArray(channel?.adminUids) ? channel.adminUids : []);
+
+        const isOwner = !!uid && ownerUid === uid;
+        const isModerator = !!uid && moderatorSource.some(
+            value => String(value || "") === uid
+        );
+        const trusted = isOwner || isModerator || channel?.trusted === true;
+
+        if (trusted) {
+            trustedChannelIds.add(channelId);
+        }
+
+        if (!enabled.has(channelId)) {
+            continue;
+        }
+
+        const type = String(channel?.type || "public").toLowerCase();
+
+        if (type !== "private" || trusted) {
+            receiveChannelIds.add(channelId);
+        }
+
+        if (trusted) {
+            transmitChannelIds.add(channelId);
+        }
+    }
+
+    ws.channelById = channelById;
+    ws.trustedChannelIds = trustedChannelIds;
+    ws.receiveChannelIds = receiveChannelIds;
+    ws.transmitChannelIds = transmitChannelIds;
+}
+
 async function refreshConnectedClientChannels(uid) {
     const ws = clients.get(uid);
 
@@ -1295,6 +1292,8 @@ async function refreshConnectedClientChannels(uid) {
         ws.enabledChannelIds = state.enabledChannelIds;
         ws.blockedChannelIds = state.blockedChannelIds;
         ws.defaultChannelId = state.defaultChannelId;
+
+        rebuildClientChannelCaches(ws);
 
         // O canal aberto na interface é independente do canal padrão.
         // Se ele deixou de existir/ficou desligado, voltamos para o padrão
@@ -9583,16 +9582,17 @@ const wss =
         server:
             httpServer,
 
-        /*
-         * Áudio AMR-WB já é comprimido. Compressão WebSocket só acrescentaria
-         * CPU/latência. O ws já desativa isto por padrão no servidor; deixamos
-         * explícito para impedir regressão por configuração futura.
-         */
+        maxPayload:
+            64 * 1024,
+
+        // Áudio já chega comprimido pelo app. Não usar permessage-deflate
+        // evita CPU/latência extra e clientTracking é desnecessário porque
+        // o servidor mantém seus próprios Maps/Sets de conexões.
         perMessageDeflate:
             false,
 
-        maxPayload:
-            64 * 1024
+        clientTracking:
+            false
     });
 
 // ============================================================
@@ -9622,71 +9622,68 @@ function isClientOnChannel(client, channelId) {
 }
 
 function channelMetadataForClient(client, channelId) {
-    if (
-        !client ||
-        !channelId ||
-        !Array.isArray(client.channels)
-    ) {
+    if (!client || !channelId) {
+        return null;
+    }
+
+    const normalized = String(channelId || "");
+
+    if (client.channelById instanceof Map) {
+        return client.channelById.get(normalized) || null;
+    }
+
+    if (!Array.isArray(client.channels)) {
         return null;
     }
 
     return (
         client.channels.find(
-            item =>
-                String(item?.id || "") ===
-                String(channelId || "")
+            item => String(item?.id || "") === normalized
         ) || null
     );
 }
 
 function isClientTrustedOnChannel(client, channelId) {
-    const channel =
-        channelMetadataForClient(
-            client,
-            channelId
-        );
+    if (!client || !channelId) {
+        return false;
+    }
+
+    const normalized = String(channelId || "");
+
+    if (client.trustedChannelIds instanceof Set) {
+        return client.trustedChannelIds.has(normalized);
+    }
+
+    const channel = channelMetadataForClient(client, normalized);
 
     if (!channel) {
         return false;
     }
 
-    const uid =
-        String(
-            client?.userId || ""
-        );
-
-    const isOwner =
-        String(
-            channel.ownerUid || ""
-        ) === uid;
-
-    const moderatorUids =
-        new Set(
-            (
-                Array.isArray(channel.moderatorUids)
-                    ? channel.moderatorUids
-                    : (
-                        Array.isArray(channel.adminUids)
-                            ? channel.adminUids
-                            : []
-                    )
-            )
-                .map(value => String(value || ""))
-                .filter(Boolean)
-        );
-
-    return (
-        isOwner ||
-        moderatorUids.has(uid) ||
-        channel.trusted === true
+    const uid = String(client?.userId || "");
+    const isOwner = String(channel.ownerUid || "") === uid;
+    const moderatorUids = Array.isArray(channel.moderatorUids)
+        ? channel.moderatorUids
+        : (Array.isArray(channel.adminUids) ? channel.adminUids : []);
+    const isModerator = moderatorUids.some(
+        value => String(value || "") === uid
     );
+
+    return isOwner || isModerator || channel.trusted === true;
 }
 
 function canClientTransmitOnChannel(client, channelId) {
-    return (
-        isClientOnChannel(client, channelId) &&
-        isClientTrustedOnChannel(client, channelId)
-    );
+    if (!isClientOnChannel(client, channelId)) {
+        return false;
+    }
+
+    const normalized = String(channelId || "");
+
+    if (client.transmitChannelIds instanceof Set) {
+        return client.transmitChannelIds.has(normalized);
+    }
+
+    return isClientTrustedOnChannel(client, normalized);
 }
 
 function canClientReceiveFromChannel(client, channelId) {
@@ -9694,36 +9691,25 @@ function canClientReceiveFromChannel(client, channelId) {
         return false;
     }
 
-    const channel =
-        channelMetadataForClient(
-            client,
-            channelId
-        );
+    const normalized = String(channelId || "");
+
+    if (client.receiveChannelIds instanceof Set) {
+        return client.receiveChannelIds.has(normalized);
+    }
+
+    const channel = channelMetadataForClient(client, normalized);
 
     if (!channel) {
         return false;
     }
 
-    const type =
-        String(
-            channel.type || "public"
-        ).toLowerCase();
+    const type = String(channel.type || "public").toLowerCase();
 
-    /*
-     * Canal público:
-     * Não confiável pode OUVIR, mas não transmitir.
-     *
-     * Canal privado:
-     * Não confiável não recebe start_tx nem áudio.
-     */
     if (type !== "private") {
         return true;
     }
 
-    return isClientTrustedOnChannel(
-        client,
-        channelId
-    );
+    return isClientTrustedOnChannel(client, normalized);
 }
 
 /*
@@ -11019,6 +11005,68 @@ function suspendReceiveForOwnTransmit(ws) {
 }
 
 // ============================================================
+// AUDIO REALTIME SEND
+// ============================================================
+
+/*
+ * O ws mantém uma fila própria por conexão. Um receptor com rede ruim não
+ * deve aumentar trabalho do hot path nem esconder o diagnóstico de atraso.
+ * Não descartamos áudio em situação normal; apenas registramos quando a fila
+ * cresce e usamos um limite de segurança extremamente alto para impedir uma
+ * conexão patológica de acumular memória indefinidamente.
+ */
+const AUDIO_BACKPRESSURE_WARN_BYTES = 64 * 1024;
+const AUDIO_BACKPRESSURE_HARD_BYTES = 1024 * 1024;
+
+function sendRealtimeAudio(client, packet) {
+    if (!isOpen(client)) {
+        return false;
+    }
+
+    const buffered = Math.max(0, Number(client.bufferedAmount || 0));
+
+    if (buffered > Number(client.audioBackpressurePeak || 0)) {
+        client.audioBackpressurePeak = buffered;
+    }
+
+    if (buffered >= AUDIO_BACKPRESSURE_WARN_BYTES) {
+        client.audioBackpressureWarnings =
+            Number(client.audioBackpressureWarnings || 0) + 1;
+
+        if (
+            client.audioBackpressureWarnings === 1 ||
+            client.audioBackpressureWarnings % 250 === 0
+        ) {
+            console.warn(
+                `[AUDIO BACKPRESSURE] user=${client.userId || "?"} ` +
+                `buffered=${buffered} peak=${client.audioBackpressurePeak}`
+            );
+        }
+    } else {
+        client.audioBackpressureWarnings = 0;
+    }
+
+    if (buffered >= AUDIO_BACKPRESSURE_HARD_BYTES) {
+        /*
+         * 1 MiB de fila para frames AMR-WB já representa áudio muito antigo.
+         * Neste ponto é melhor não aumentar indefinidamente a fila desse
+         * cliente. Os demais ouvintes continuam recebendo normalmente.
+         */
+        return false;
+    }
+
+    client.send(
+        packet,
+        {
+            binary: true,
+            compress: false
+        }
+    );
+
+    return true;
+}
+
+// ============================================================
 // AUDIO VALIDATION
 // ============================================================
 
@@ -11519,6 +11567,8 @@ async function handleJson(
             ws.defaultChannelId =
                 channelState.defaultChannelId;
 
+            rebuildClientChannelCaches(ws);
+
             // Ao conectar pela primeira vez, o canal padrão é a seleção
             // inicial. A Activity pode trocar imediatamente via select_channel.
             ws.activeChannelId =
@@ -11546,6 +11596,7 @@ async function handleJson(
             ws.enabledChannelIds = new Set();
             ws.blockedChannelIds = new Set();
             ws.defaultChannelId = null;
+            rebuildClientChannelCaches(ws);
             ws.activeChannelId = null;
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
@@ -12895,26 +12946,29 @@ function removeClientPresence(
 
 wss.on(
     "connection",
-    (
-        ws,
-        request
-    ) => {
-
-        /*
-         * PTT favorece latência, não throughput em blocos grandes. Desabilitar
-         * Nagle evita que pequenos frames aguardem agrupamento TCP. O keepalive
-         * ajuda o SO a detectar conexões quebradas sem interferir no heartbeat
-         * WebSocket da aplicação.
-         */
-        try {
-            request?.socket?.setNoDelay(true);
-            request?.socket?.setKeepAlive(true, 15_000);
-        } catch (_) {
-        }
+    ws => {
 
         console.log(
             "[WS] Cliente conectado"
         );
+
+        /*
+         * PTT em tempo real: evita que pequenos frames aguardem o algoritmo
+         * de Nagle. O ws normalmente já usa noDelay, mas deixamos explícito
+         * e habilitamos keep-alive TCP como proteção adicional de rede.
+         */
+        try {
+            ws._socket?.setNoDelay(true);
+            ws._socket?.setKeepAlive(true, 30_000);
+        } catch (_) {
+        }
+
+        ws.channelById = new Map();
+        ws.trustedChannelIds = new Set();
+        ws.receiveChannelIds = new Set();
+        ws.transmitChannelIds = new Set();
+        ws.audioBackpressurePeak = 0;
+        ws.audioBackpressureWarnings = 0;
 
         ws.isMasterAdminMonitor =
             false;
@@ -12994,18 +13048,6 @@ wss.on(
         ws.lastSeenAt =
             Date.now();
 
-        ws.audioBackpressureDrops =
-            0;
-
-        ws.audioBackpressureLastLogAt =
-            0;
-
-        ws.masterMonitorDroppedPcmChunks =
-            0;
-
-        ws.masterMonitorDroppedAmrFrames =
-            0;
-
         ws.on(
             "pong",
             () => {
@@ -13020,7 +13062,7 @@ wss.on(
 
         ws.on(
             "message",
-            (
+            async (
                 data,
                 isBinary
             ) => {
@@ -13088,75 +13130,35 @@ wss.on(
                     }
 
                     let delivered = 0;
-                    let backpressured = 0;
 
                     for (const client of clients.values()) {
-                        /*
-                         * FAST PATH DO ÁUDIO
-                         *
-                         * rxChannelId só é atribuído depois das regras de
-                         * participação, bloqueio, canal privado e confiança
-                         * terem sido validadas. refreshConnectedClientChannels
-                         * remove a seleção imediatamente quando a permissão muda.
-                         * Portanto não repetimos buscas/Set a cada frame de 20 ms.
-                         */
                         if (
-                            !isOpen(client) ||
-                            client.rxChannelId !== channelId ||
-                            client.txChannelId ||
-                            client.userId === ws.userId
+                            canClientReceiveFromChannel(
+                                client,
+                                channelId
+                            ) &&
+                            client.rxChannelId === channelId &&
+                            !client.txChannelId &&
+                            client.userId !== ws.userId
                         ) {
-                            continue;
-                        }
+                            try {
+                                if (
+                                    sendRealtimeAudio(
+                                        client,
+                                        data
+                                    )
+                                ) {
+                                    delivered++;
+                                }
 
-                        /*
-                         * Um receptor com rede ruim não pode acumular uma fila
-                         * enorme e aumentar memória/GC para todos. Em condições
-                         * normais bufferedAmount fica próximo de zero.
-                         */
-                        if (
-                            Number(client.bufferedAmount || 0) >
-                                MAX_AUDIO_BUFFERED_BYTES
-                        ) {
-                            client.audioBackpressureDrops =
-                                Number(client.audioBackpressureDrops || 0) + 1;
-                            backpressured++;
-
-                            const now = Date.now();
-                            if (
-                                now - Number(client.audioBackpressureLastLogAt || 0) >=
-                                    5_000
-                            ) {
-                                client.audioBackpressureLastLogAt = now;
-                                console.warn(
-                                    `[AUDIO BACKPRESSURE] ` +
-                                    `listener=${client.userId} ` +
+                            } catch (error) {
+                                console.error(
+                                    `[AUDIO TX ERROR] ` +
                                     `channel=${channelId} ` +
-                                    `buffered=${client.bufferedAmount} ` +
-                                    `drops=${client.audioBackpressureDrops}`
+                                    `para=${client.userId} ` +
+                                    `${error.message}`
                                 );
                             }
-
-                            continue;
-                        }
-
-                        try {
-                            client.send(
-                                data,
-                                {
-                                    binary: true
-                                }
-                            );
-
-                            delivered++;
-
-                        } catch (error) {
-                            console.error(
-                                `[AUDIO TX ERROR] ` +
-                                `channel=${channelId} ` +
-                                `para=${client.userId} ` +
-                                `${error.message}`
-                            );
                         }
                     }
 
@@ -13195,13 +13197,10 @@ wss.on(
                     }
 
                     if (
-                        AUDIO_PACKET_DEBUG &&
-                        (
-                            txState.audioPacketCount === 1 ||
-                            txState.audioPacketCount % 250 === 0
-                        )
+                        txState.audioPacketCount === 1 ||
+                        txState.audioPacketCount % 100 === 0
                     ) {
-                        const codecPayloadSize =
+                        const opusSize =
                             data.length - AUDIO_HEADER_SIZE;
 
                         console.log(
@@ -13209,9 +13208,8 @@ wss.on(
                             `de=${ws.userId} ` +
                             `channel=${channelId} ` +
                             `bytes=${data.length} ` +
-                            `payload=${codecPayloadSize} ` +
-                            `destinatarios=${delivered} ` +
-                            `backpressure=${backpressured}`
+                            `opus=${opusSize} ` +
+                            `destinatarios=${delivered}`
                         );
                     }
 
@@ -13256,19 +13254,9 @@ wss.on(
                     return;
                 }
 
-                Promise.resolve(
-                    handleJson(
-                        ws,
-                        message
-                    )
-                ).catch(
-                    error => {
-                        console.error(
-                            `[JSON HANDLE ERROR] ` +
-                            `${ws.userId || "não identificado"}: ` +
-                            `${error?.stack || error?.message || error}`
-                        );
-                    }
+                await handleJson(
+                    ws,
+                    message
                 );
             }
         );
@@ -13543,23 +13531,10 @@ setInterval(
     () => {
         let packetCount = 0;
         let byteCount = 0;
-        let backpressureDrops = 0;
-        let maxBufferedAmount = 0;
 
         for (const state of activeTransmitters.values()) {
             packetCount += Number(state.audioPacketCount || 0);
             byteCount += Number(state.audioBytesRelayed || 0);
-        }
-
-        for (const client of clients.values()) {
-            backpressureDrops +=
-                Number(client.audioBackpressureDrops || 0);
-
-            maxBufferedAmount =
-                Math.max(
-                    maxBufferedAmount,
-                    Number(client.bufferedAmount || 0)
-                );
         }
 
         if (packetCount > 0) {
@@ -13567,9 +13542,7 @@ setInterval(
                 `[AUDIO STATS] ` +
                 `canaisAtivos=${activeTransmitters.size} ` +
                 `pacotes=${packetCount} ` +
-                `bytes=${byteCount} ` +
-                `backpressureDrops=${backpressureDrops} ` +
-                `maxBuffered=${maxBufferedAmount}`
+                `bytes=${byteCount}`
             );
         }
     },
