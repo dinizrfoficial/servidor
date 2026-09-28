@@ -1,21 +1,7 @@
 const http = require("http");
 const WebSocket = require("ws");
-const { spawn } = require("child_process");
-
-let ffmpegPath =
-    process.env.FFMPEG_PATH ||
-    null;
-
-if (!ffmpegPath) {
-    try {
-        ffmpegPath =
-            require("ffmpeg-static");
-    } catch (_) {
-        ffmpegPath =
-            "ffmpeg";
-    }
-}
 const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 
 // ============================================================
@@ -200,333 +186,215 @@ const masterAdminMonitors =
 
 
 /*
- * Áudio do painel mestre.
+ * Áudio do painel mestre — relay AMR-WB direto.
  *
- * O app atual transmite AMR-WB (16 kHz, mono, 20 ms).
- * Navegadores desktop não oferecem decodificação AMR-WB de forma confiável,
- * então o servidor converte SOMENTE o fluxo do painel mestre para PCM S16LE.
+ * O app Android já transmite AMR-WB (16 kHz, mono, frames de 20 ms).
+ * O servidor NÃO decodifica nem recodifica o áudio do painel.
  *
- * Pacote enviado ao navegador:
- *   0  = 0x5A  ('Z')
- *   1  = 0x4C  ('L')
- *   2  = 0x50  ('P')
- *   3  = 0x43  ('C')
- *   4  = 0x4D  ('M')
- *   5  = 0x01  (versão)
- *   6+ = PCM signed 16-bit little-endian, 16 kHz, mono
+ * O mesmo pacote binário Z-Link recebido do celular é enviado ao navegador:
+ *
+ *   0  = 0x5A ('Z')
+ *   1  = 0x4C ('L')
+ *   2  = 0x01 (versão)
+ *   3  = 0x01 (codec AMR-WB)
+ *   4-5 = sequência uint16 big-endian
+ *   6+ = frame AMR-WB storage, incluindo byte TOC
+ *
+ * A decodificação acontece no navegador com OpenCORE AMR compilado para
+ * WebAssembly (@audio/decode-amr). Isso remove FFmpeg do caminho crítico
+ * do monitor mestre e mantém celular -> celular totalmente independente.
  */
-const MASTER_PCM_HEADER =
-    Buffer.from([
-        0x5A,
-        0x4C,
-        0x50,
-        0x43,
-        0x4D,
-        0x01
-    ]);
+const MASTER_AUDIO_CODEC =
+    "amr-wb";
 
-const AMR_WB_FILE_HEADER =
-    Buffer.from(
-        "#!AMR-WB\n",
-        "ascii"
-    );
+const MASTER_AUDIO_SAMPLE_RATE =
+    16000;
 
-function stopMasterMonitorTranscoder(
-    ws,
-    reason = "stop"
-) {
-    const child =
-        ws?.masterMonitorTranscoder;
+const MASTER_AUDIO_CHANNELS =
+    1;
 
-    ws.masterMonitorTranscoder =
-        null;
+/*
+ * O pacote npm do decoder é servido pelo próprio Render.
+ * O código WebAssembly continua executando no navegador; o servidor apenas
+ * entrega os dois módulos JavaScript estáticos ao painel.
+ */
+let panelAmrDecoderEntry =
+    null;
 
-    if (!child) {
-        return;
+let panelAmrWasmEntry =
+    null;
+
+function resolvePanelAmrDecoderFiles() {
+    if (
+        panelAmrDecoderEntry &&
+        panelAmrWasmEntry
+    ) {
+        return true;
     }
 
-    child.zlinkExpectedStop =
-        true;
-
     try {
+        const entry =
+            require.resolve(
+                "@audio/decode-amr"
+            );
+
+        const baseDir =
+            path.dirname(
+                entry
+            );
+
+        const wasmEntry =
+            path.join(
+                baseDir,
+                "src",
+                "amr.wasm.js"
+            );
+
         if (
-            child.stdin &&
-            !child.stdin.destroyed
+            !fs.existsSync(entry) ||
+            !fs.existsSync(wasmEntry)
         ) {
-            child.stdin.end();
+            throw new Error(
+                "Arquivos do decoder AMR não encontrados no pacote instalado."
+            );
         }
-    } catch (_) {
-    }
 
-    try {
-        child.kill(
-            "SIGKILL"
+        panelAmrDecoderEntry =
+            entry;
+
+        panelAmrWasmEntry =
+            wasmEntry;
+
+        return true;
+    } catch (error) {
+        panelAmrDecoderEntry =
+            null;
+
+        panelAmrWasmEntry =
+            null;
+
+        console.error(
+            "[PANEL CODEC] decoder AMR-WB indisponível:",
+            error?.message || error
         );
-    } catch (_) {
-    }
 
-    console.log(
-        `[MASTER AUDIO] transcoder stop reason=${reason}`
-    );
+        return false;
+    }
 }
 
-function startMasterMonitorTranscoder(
-    ws
+function servePanelAmrDecoder(
+    req,
+    res
 ) {
-    stopMasterMonitorTranscoder(
-        ws,
-        "restart"
-    );
+    const pathname =
+        String(req.url || "")
+            .split("?")[0];
+
+    let filePath =
+        null;
 
     if (
-        !ws ||
-        ws.readyState !==
-            WebSocket.OPEN
+        pathname ===
+        "/panel-codec/decode-amr.js"
     ) {
+        if (
+            resolvePanelAmrDecoderFiles()
+        ) {
+            filePath =
+                panelAmrDecoderEntry;
+        }
+    } else if (
+        pathname ===
+        "/panel-codec/src/amr.wasm.js"
+    ) {
+        if (
+            resolvePanelAmrDecoderFiles()
+        ) {
+            filePath =
+                panelAmrWasmEntry;
+        }
+    } else {
         return false;
     }
 
-    let child;
-
-    try {
-        child =
-            spawn(
-                ffmpegPath,
-                [
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-threads",
-                    "1",
-
-                    /*
-                     * O cabeçalho AMR-WB é escrito no stdin logo após o spawn.
-                     * O formato amr detecta AMR-WB através desse cabeçalho.
-                     */
-                    "-f",
-                    "amr",
-                    "-i",
-                    "pipe:0",
-
-                    "-vn",
-
-                    "-acodec",
-                    "pcm_s16le",
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-
-                    "-f",
-                    "s16le",
-                    "pipe:1"
-                ],
-                {
-                    stdio: [
-                        "pipe",
-                        "pipe",
-                        "pipe"
-                    ]
-                }
-            );
-    } catch (
-        error
-    ) {
-        console.error(
-            "[MASTER AUDIO] não foi possível iniciar FFmpeg:",
-            error?.message || error
-        );
-
-        sendMasterMonitorJson(
-            ws,
+    if (!filePath) {
+        res.writeHead(
+            503,
             {
-                type:
-                    "admin_monitor_audio_error",
-
-                message:
-                    "O servidor não conseguiu iniciar o decodificador AMR-WB."
+                "Content-Type":
+                    "text/plain; charset=utf-8",
+                "Cache-Control":
+                    "no-store"
             }
         );
 
-        return false;
+        res.end(
+            "Decoder AMR-WB não está disponível no servidor."
+        );
+
+        return true;
     }
 
-    ws.masterMonitorTranscoder =
-        child;
-
-    ws.masterMonitorTranscoderError =
-        "";
-
-    child.stdout.on(
-        "data",
-        chunk => {
-            if (
-                !chunk ||
-                chunk.length === 0 ||
-                ws.readyState !==
-                    WebSocket.OPEN ||
-                ws.masterMonitorTranscoder !==
-                    child
-            ) {
-                return;
-            }
-
-            /*
-             * O painel mestre é auxiliar. Se o navegador estiver lento,
-             * nunca permitimos que seu PCM crie uma fila grande no servidor.
-             */
-            if (Number(ws.bufferedAmount || 0) >= 512 * 1024) {
-                return;
-            }
-
-            try {
-                ws.send(
-                    Buffer.concat(
-                        [
-                            MASTER_PCM_HEADER,
-                            chunk
-                        ]
-                    ),
-                    {
-                        binary: true,
-                        compress: false
-                    }
-                );
-            } catch (_) {
-            }
-        }
-    );
-
-    child.stderr.on(
-        "data",
-        chunk => {
-            const text =
-                String(
-                    chunk || ""
-                );
-
-            if (!text) {
-                return;
-            }
-
-            ws.masterMonitorTranscoderError =
-                (
-                    String(
-                        ws.masterMonitorTranscoderError ||
-                        ""
-                    ) +
-                    text
-                ).slice(
-                    -4000
-                );
-        }
-    );
-
-    child.on(
-        "error",
-        error => {
-            if (
-                child.zlinkExpectedStop
-            ) {
-                return;
-            }
-
-            console.error(
-                "[MASTER AUDIO] FFmpeg error:",
-                error?.message || error
-            );
-
-            sendMasterMonitorJson(
-                ws,
-                {
-                    type:
-                        "admin_monitor_audio_error",
-
-                    message:
-                        "Falha no decodificador de áudio do servidor."
-                }
-            );
-        }
-    );
-
-    child.on(
-        "close",
-        code => {
-            if (
-                ws.masterMonitorTranscoder ===
-                    child
-            ) {
-                ws.masterMonitorTranscoder =
-                    null;
-            }
-
-            if (
-                child.zlinkExpectedStop
-            ) {
-                return;
-            }
-
-            const detail =
-                String(
-                    ws.masterMonitorTranscoderError ||
-                    ""
-                ).trim();
-
-            console.error(
-                `[MASTER AUDIO] FFmpeg encerrou code=${code}` +
-                (
-                    detail
-                        ? ` detail=${detail}`
-                        : ""
-                )
-            );
-
-            if (
-                ws.readyState ===
-                    WebSocket.OPEN &&
-                ws.masterMonitorChannelId
-            ) {
-                sendMasterMonitorJson(
-                    ws,
-                    {
-                        type:
-                            "admin_monitor_audio_error",
-
-                        message:
-                            "O decodificador AMR-WB do servidor foi encerrado."
-                    }
-                );
-            }
-        }
-    );
-
-    /*
-     * AMR-WB em formato storage precisa deste magic antes dos frames.
-     * Os pacotes gerados pelo MediaCodec do Android já contêm o byte TOC
-     * de cada frame, portanto basta remover o cabeçalho Z-Link de 6 bytes
-     * e entregá-los sequencialmente ao demuxer AMR.
-     */
     try {
-        child.stdin.write(
-            AMR_WB_FILE_HEADER
+        const body =
+            fs.readFileSync(
+                filePath
+            );
+
+        res.writeHead(
+            200,
+            {
+                "Content-Type":
+                    "text/javascript; charset=utf-8",
+                "Cache-Control":
+                    "public, max-age=86400",
+                "Cross-Origin-Resource-Policy":
+                    "cross-origin"
+            }
         );
-    } catch (
-        error
-    ) {
+
+        res.end(
+            body
+        );
+    } catch (error) {
         console.error(
-            "[MASTER AUDIO] falha escrevendo cabeçalho AMR-WB:",
+            "[PANEL CODEC] erro ao servir decoder:",
             error?.message || error
         );
 
-        stopMasterMonitorTranscoder(
-            ws,
-            "header-error"
+        res.writeHead(
+            500,
+            {
+                "Content-Type":
+                    "text/plain; charset=utf-8",
+                "Cache-Control":
+                    "no-store"
+            }
         );
 
-        return false;
+        res.end(
+            "Falha ao carregar decoder AMR-WB."
+        );
     }
 
     return true;
+}
+
+function resetMasterMonitorAudioRelay(
+    ws,
+    reason = "reset"
+) {
+    if (!ws) {
+        return;
+    }
+
+    /*
+     * Não há processo, codec ou buffer PCM no servidor para encerrar.
+     * O evento admin_monitor_tx_start faz o navegador reinicializar seu
+     * decoder AMR-WB para cada nova transmissão.
+     */
+    ws.masterMonitorAudioRelayReason =
+        reason;
 }
 
 function feedMasterMonitorAudioPacket(
@@ -547,64 +415,63 @@ function feedMasterMonitorAudioPacket(
         packet[1] !==
             AUDIO_MAGIC_1 ||
         packet[2] !==
-            AUDIO_VERSION
+            AUDIO_VERSION ||
+        packet[3] !==
+            0x01
     ) {
         return;
     }
-
-    let child =
-        ws.masterMonitorTranscoder;
-
-    if (
-        !child ||
-        !child.stdin ||
-        child.stdin.destroyed
-    ) {
-        if (
-            !startMasterMonitorTranscoder(
-                ws
-            )
-        ) {
-            return;
-        }
-
-        child =
-            ws.masterMonitorTranscoder;
-    }
-
-    if (
-        !child ||
-        !child.stdin ||
-        child.stdin.destroyed
-    ) {
-        return;
-    }
-
-    const amrFrame =
-        packet.subarray(
-            AUDIO_HEADER_SIZE
-        );
 
     /*
-     * Se o FFmpeg/painel não acompanhar em tempo real, descartamos somente
-     * áudio do monitor administrativo. O relay entre celulares nunca espera
-     * por este transcoder.
+     * O painel nunca pode gerar pressão de volta sobre celular -> celular.
+     * Como AMR-WB é muito compacto, um limite pequeno já representa muitos
+     * frames. Se o navegador ficar atrasado, é melhor descartar áudio antigo
+     * do monitor do que aumentar latência/memória do processo inteiro.
      */
-    if (Number(child.stdin.writableLength || 0) >= 64 * 1024) {
+    if (
+        Number(ws.bufferedAmount || 0) >
+            MAX_MASTER_AMR_BUFFERED_BYTES
+    ) {
+        ws.masterMonitorDroppedAmrFrames =
+            Number(
+                ws.masterMonitorDroppedAmrFrames ||
+                0
+            ) + 1;
+
+        const now =
+            Date.now();
+
+        if (
+            now -
+                Number(
+                    ws.masterMonitorBackpressureLastLogAt ||
+                    0
+                ) >=
+            5_000
+        ) {
+            ws.masterMonitorBackpressureLastLogAt =
+                now;
+
+            console.warn(
+                `[MASTER AUDIO BACKPRESSURE] ` +
+                `channel=${ws.masterMonitorChannelId || "nenhum"} ` +
+                `buffered=${Number(ws.bufferedAmount || 0)} ` +
+                `drops=${ws.masterMonitorDroppedAmrFrames}`
+            );
+        }
+
         return;
     }
 
     try {
-        child.stdin.write(
-            amrFrame
+        ws.send(
+            packet,
+            {
+                binary:
+                    true
+            }
         );
-    } catch (
-        error
-    ) {
-        console.error(
-            "[MASTER AUDIO] falha enviando AMR-WB ao FFmpeg:",
-            error?.message || error
-        );
+    } catch (_) {
     }
 }
 
@@ -643,6 +510,51 @@ const AUDIO_VERSION =
 
 const AUDIO_HEADER_SIZE =
     6;
+
+/*
+ * Proteções do caminho crítico de áudio.
+ *
+ * O áudio PTT é tráfego em tempo real: uma fila WebSocket muito grande não
+ * ajuda o ouvinte, apenas transforma áudio atual em áudio atrasado e aumenta
+ * uso de memória/GC do processo. Em situação normal bufferedAmount fica perto
+ * de zero; estes limites atuam somente quando um destino realmente congestionou.
+ */
+function positiveIntegerEnv(
+    name,
+    fallback,
+    minimum
+) {
+    const value =
+        Number(process.env[name]);
+
+    if (
+        !Number.isFinite(value) ||
+        value < minimum
+    ) {
+        return fallback;
+    }
+
+    return Math.floor(value);
+}
+
+const MAX_AUDIO_BUFFERED_BYTES =
+    positiveIntegerEnv(
+        "ZLINK_MAX_AUDIO_BUFFERED_BYTES",
+        24 * 1024,
+        8 * 1024
+    );
+
+const MAX_MASTER_AMR_BUFFERED_BYTES =
+    positiveIntegerEnv(
+        "ZLINK_MAX_MASTER_AMR_BUFFERED_BYTES",
+        64 * 1024,
+        8 * 1024
+    );
+
+const AUDIO_PACKET_DEBUG =
+    String(process.env.ZLINK_AUDIO_PACKET_DEBUG || "")
+        .trim()
+        .toLowerCase() === "true";
 
 /*
  * Quantidade de pacotes iniciais preservados de cada transmissão.
@@ -1218,64 +1130,6 @@ async function loadClientChannelState(uid) {
     };
 }
 
-function rebuildClientChannelCaches(ws) {
-    if (!ws) {
-        return;
-    }
-
-    const channelById = new Map();
-    const trustedChannelIds = new Set();
-    const receiveChannelIds = new Set();
-    const transmitChannelIds = new Set();
-
-    const uid = String(ws.userId || "");
-    const enabled = ws.enabledChannelIds || new Set();
-
-    for (const channel of (Array.isArray(ws.channels) ? ws.channels : [])) {
-        const channelId = String(channel?.id || "");
-
-        if (!channelId) {
-            continue;
-        }
-
-        channelById.set(channelId, channel);
-
-        const ownerUid = String(channel?.ownerUid || "");
-        const moderatorSource = Array.isArray(channel?.moderatorUids)
-            ? channel.moderatorUids
-            : (Array.isArray(channel?.adminUids) ? channel.adminUids : []);
-
-        const isOwner = !!uid && ownerUid === uid;
-        const isModerator = !!uid && moderatorSource.some(
-            value => String(value || "") === uid
-        );
-        const trusted = isOwner || isModerator || channel?.trusted === true;
-
-        if (trusted) {
-            trustedChannelIds.add(channelId);
-        }
-
-        if (!enabled.has(channelId)) {
-            continue;
-        }
-
-        const type = String(channel?.type || "public").toLowerCase();
-
-        if (type !== "private" || trusted) {
-            receiveChannelIds.add(channelId);
-        }
-
-        if (trusted) {
-            transmitChannelIds.add(channelId);
-        }
-    }
-
-    ws.channelById = channelById;
-    ws.trustedChannelIds = trustedChannelIds;
-    ws.receiveChannelIds = receiveChannelIds;
-    ws.transmitChannelIds = transmitChannelIds;
-}
-
 async function refreshConnectedClientChannels(uid) {
     const ws = clients.get(uid);
 
@@ -1292,8 +1146,6 @@ async function refreshConnectedClientChannels(uid) {
         ws.enabledChannelIds = state.enabledChannelIds;
         ws.blockedChannelIds = state.blockedChannelIds;
         ws.defaultChannelId = state.defaultChannelId;
-
-        rebuildClientChannelCaches(ws);
 
         // O canal aberto na interface é independente do canal padrão.
         // Se ele deixou de existir/ficou desligado, voltamos para o padrão
@@ -8438,8 +8290,9 @@ function sendMasterMonitorTxStart(ws, channelId, state) {
          * Reiniciar o decoder no começo evita carregar estado AMR-WB do
          * falante anterior e elimina artefatos entre transmissões.
          */
-        startMasterMonitorTranscoder(
-            ws
+        resetMasterMonitorAudioRelay(
+            ws,
+            "tx-start"
         );
     }
 
@@ -8456,7 +8309,11 @@ function sendMasterMonitorTxStart(ws, channelId, state) {
         userId: String(state.userId || ""),
         name: String(state.name || state.userId || "Usuário"),
         startedAt: Number(state.startedAt || Date.now()),
-        assistantGenerated: state.assistantGenerated === true
+        assistantGenerated: state.assistantGenerated === true,
+        audioFormat: MASTER_AUDIO_CODEC,
+        sampleRate: MASTER_AUDIO_SAMPLE_RATE,
+        channels: MASTER_AUDIO_CHANNELS,
+        packetFormat: "zlink-audio-v1"
     });
 }
 
@@ -8617,7 +8474,7 @@ function selectMasterMonitorAllChannel(
             oldestActiveMasterMonitorTransmission();
 
         if (!selected) {
-            stopMasterMonitorTranscoder(
+            resetMasterMonitorAudioRelay(
                 ws,
                 "all-waiting"
             );
@@ -8646,7 +8503,7 @@ function selectMasterMonitorAllChannel(
             selected.state;
     }
 
-    stopMasterMonitorTranscoder(
+    resetMasterMonitorAudioRelay(
         ws,
         "all-channel-select"
     );
@@ -8756,7 +8613,7 @@ function notifyMasterMonitorsTxStop(channelId, state) {
 
         monitor.masterMonitorTxKey = null;
 
-        stopMasterMonitorTranscoder(
+        resetMasterMonitorAudioRelay(
             monitor,
             "tx-stop"
         );
@@ -8805,8 +8662,8 @@ async function handleMasterMonitorJson(ws, data) {
         ws.masterMonitorMode = "none";
         ws.masterMonitorChannelId = null;
         ws.masterMonitorTxKey = null;
-        ws.masterMonitorTranscoder = null;
-        ws.masterMonitorTranscoderError = "";
+        ws.masterMonitorAudioRelayReason = "identify";
+        ws.masterMonitorBackpressureLastLogAt = 0;
         masterAdminMonitors.add(ws);
 
         sendMasterMonitorJson(ws, {
@@ -8833,7 +8690,7 @@ async function handleMasterMonitorJson(ws, data) {
             return true;
         }
 
-        stopMasterMonitorTranscoder(
+        resetMasterMonitorAudioRelay(
             ws,
             "channel-select"
         );
@@ -8865,7 +8722,7 @@ async function handleMasterMonitorJson(ws, data) {
         data.type ===
         "admin_monitor_all_start"
     ) {
-        stopMasterMonitorTranscoder(
+        resetMasterMonitorAudioRelay(
             ws,
             "all-start"
         );
@@ -8897,7 +8754,7 @@ async function handleMasterMonitorJson(ws, data) {
     }
 
     if (data.type === "admin_monitor_stop") {
-        stopMasterMonitorTranscoder(
+        resetMasterMonitorAudioRelay(
             ws,
             "monitor-stop"
         );
@@ -8951,6 +8808,20 @@ const httpServer =
 
                 res.end();
 
+                return;
+            }
+
+            // ------------------------------------------------
+            // PANEL AMR-WB DECODER (WASM executa no navegador)
+            // ------------------------------------------------
+
+            if (
+                req.method === "GET" &&
+                servePanelAmrDecoder(
+                    req,
+                    res
+                )
+            ) {
                 return;
             }
 
@@ -9069,6 +8940,9 @@ const httpServer =
 
                         firebase:
                             firebaseReady,
+
+                        masterMonitorAudio:
+                            "amr-wb-browser-decoder",
 
                         timestamp:
                             Date.now()
@@ -9582,17 +9456,16 @@ const wss =
         server:
             httpServer,
 
-        maxPayload:
-            64 * 1024,
-
-        // Áudio já chega comprimido pelo app. Não usar permessage-deflate
-        // evita CPU/latência extra e clientTracking é desnecessário porque
-        // o servidor mantém seus próprios Maps/Sets de conexões.
+        /*
+         * Áudio AMR-WB já é comprimido. Compressão WebSocket só acrescentaria
+         * CPU/latência. O ws já desativa isto por padrão no servidor; deixamos
+         * explícito para impedir regressão por configuração futura.
+         */
         perMessageDeflate:
             false,
 
-        clientTracking:
-            false
+        maxPayload:
+            64 * 1024
     });
 
 // ============================================================
@@ -9622,68 +9495,71 @@ function isClientOnChannel(client, channelId) {
 }
 
 function channelMetadataForClient(client, channelId) {
-    if (!client || !channelId) {
-        return null;
-    }
-
-    const normalized = String(channelId || "");
-
-    if (client.channelById instanceof Map) {
-        return client.channelById.get(normalized) || null;
-    }
-
-    if (!Array.isArray(client.channels)) {
+    if (
+        !client ||
+        !channelId ||
+        !Array.isArray(client.channels)
+    ) {
         return null;
     }
 
     return (
         client.channels.find(
-            item => String(item?.id || "") === normalized
+            item =>
+                String(item?.id || "") ===
+                String(channelId || "")
         ) || null
     );
 }
 
 function isClientTrustedOnChannel(client, channelId) {
-    if (!client || !channelId) {
-        return false;
-    }
-
-    const normalized = String(channelId || "");
-
-    if (client.trustedChannelIds instanceof Set) {
-        return client.trustedChannelIds.has(normalized);
-    }
-
-    const channel = channelMetadataForClient(client, normalized);
+    const channel =
+        channelMetadataForClient(
+            client,
+            channelId
+        );
 
     if (!channel) {
         return false;
     }
 
-    const uid = String(client?.userId || "");
-    const isOwner = String(channel.ownerUid || "") === uid;
-    const moderatorUids = Array.isArray(channel.moderatorUids)
-        ? channel.moderatorUids
-        : (Array.isArray(channel.adminUids) ? channel.adminUids : []);
-    const isModerator = moderatorUids.some(
-        value => String(value || "") === uid
-    );
+    const uid =
+        String(
+            client?.userId || ""
+        );
 
-    return isOwner || isModerator || channel.trusted === true;
+    const isOwner =
+        String(
+            channel.ownerUid || ""
+        ) === uid;
+
+    const moderatorUids =
+        new Set(
+            (
+                Array.isArray(channel.moderatorUids)
+                    ? channel.moderatorUids
+                    : (
+                        Array.isArray(channel.adminUids)
+                            ? channel.adminUids
+                            : []
+                    )
+            )
+                .map(value => String(value || ""))
+                .filter(Boolean)
+        );
+
+    return (
+        isOwner ||
+        moderatorUids.has(uid) ||
+        channel.trusted === true
+    );
 }
 
 function canClientTransmitOnChannel(client, channelId) {
-    if (!isClientOnChannel(client, channelId)) {
-        return false;
-    }
-
-    const normalized = String(channelId || "");
-
-    if (client.transmitChannelIds instanceof Set) {
-        return client.transmitChannelIds.has(normalized);
-    }
-
-    return isClientTrustedOnChannel(client, normalized);
+    return (
+        isClientOnChannel(client, channelId) &&
+        isClientTrustedOnChannel(client, channelId)
+    );
 }
 
 function canClientReceiveFromChannel(client, channelId) {
@@ -9691,25 +9567,36 @@ function canClientReceiveFromChannel(client, channelId) {
         return false;
     }
 
-    const normalized = String(channelId || "");
-
-    if (client.receiveChannelIds instanceof Set) {
-        return client.receiveChannelIds.has(normalized);
-    }
-
-    const channel = channelMetadataForClient(client, normalized);
+    const channel =
+        channelMetadataForClient(
+            client,
+            channelId
+        );
 
     if (!channel) {
         return false;
     }
 
-    const type = String(channel.type || "public").toLowerCase();
+    const type =
+        String(
+            channel.type || "public"
+        ).toLowerCase();
 
+    /*
+     * Canal público:
+     * Não confiável pode OUVIR, mas não transmitir.
+     *
+     * Canal privado:
+     * Não confiável não recebe start_tx nem áudio.
+     */
     if (type !== "private") {
         return true;
     }
 
-    return isClientTrustedOnChannel(client, normalized);
+    return isClientTrustedOnChannel(
+        client,
+        channelId
+    );
 }
 
 /*
@@ -11005,68 +10892,6 @@ function suspendReceiveForOwnTransmit(ws) {
 }
 
 // ============================================================
-// AUDIO REALTIME SEND
-// ============================================================
-
-/*
- * O ws mantém uma fila própria por conexão. Um receptor com rede ruim não
- * deve aumentar trabalho do hot path nem esconder o diagnóstico de atraso.
- * Não descartamos áudio em situação normal; apenas registramos quando a fila
- * cresce e usamos um limite de segurança extremamente alto para impedir uma
- * conexão patológica de acumular memória indefinidamente.
- */
-const AUDIO_BACKPRESSURE_WARN_BYTES = 64 * 1024;
-const AUDIO_BACKPRESSURE_HARD_BYTES = 1024 * 1024;
-
-function sendRealtimeAudio(client, packet) {
-    if (!isOpen(client)) {
-        return false;
-    }
-
-    const buffered = Math.max(0, Number(client.bufferedAmount || 0));
-
-    if (buffered > Number(client.audioBackpressurePeak || 0)) {
-        client.audioBackpressurePeak = buffered;
-    }
-
-    if (buffered >= AUDIO_BACKPRESSURE_WARN_BYTES) {
-        client.audioBackpressureWarnings =
-            Number(client.audioBackpressureWarnings || 0) + 1;
-
-        if (
-            client.audioBackpressureWarnings === 1 ||
-            client.audioBackpressureWarnings % 250 === 0
-        ) {
-            console.warn(
-                `[AUDIO BACKPRESSURE] user=${client.userId || "?"} ` +
-                `buffered=${buffered} peak=${client.audioBackpressurePeak}`
-            );
-        }
-    } else {
-        client.audioBackpressureWarnings = 0;
-    }
-
-    if (buffered >= AUDIO_BACKPRESSURE_HARD_BYTES) {
-        /*
-         * 1 MiB de fila para frames AMR-WB já representa áudio muito antigo.
-         * Neste ponto é melhor não aumentar indefinidamente a fila desse
-         * cliente. Os demais ouvintes continuam recebendo normalmente.
-         */
-        return false;
-    }
-
-    client.send(
-        packet,
-        {
-            binary: true,
-            compress: false
-        }
-    );
-
-    return true;
-}
-
-// ============================================================
 // AUDIO VALIDATION
 // ============================================================
 
@@ -11567,8 +11392,6 @@ async function handleJson(
             ws.defaultChannelId =
                 channelState.defaultChannelId;
 
-            rebuildClientChannelCaches(ws);
-
             // Ao conectar pela primeira vez, o canal padrão é a seleção
             // inicial. A Activity pode trocar imediatamente via select_channel.
             ws.activeChannelId =
@@ -11596,7 +11419,6 @@ async function handleJson(
             ws.enabledChannelIds = new Set();
             ws.blockedChannelIds = new Set();
             ws.defaultChannelId = null;
-            rebuildClientChannelCaches(ws);
             ws.activeChannelId = null;
             ws.visibleChannelId = null;
             ws.assistantExclusiveChannelId = null;
@@ -12946,29 +12768,26 @@ function removeClientPresence(
 
 wss.on(
     "connection",
-    ws => {
+    (
+        ws,
+        request
+    ) => {
+
+        /*
+         * PTT favorece latência, não throughput em blocos grandes. Desabilitar
+         * Nagle evita que pequenos frames aguardem agrupamento TCP. O keepalive
+         * ajuda o SO a detectar conexões quebradas sem interferir no heartbeat
+         * WebSocket da aplicação.
+         */
+        try {
+            request?.socket?.setNoDelay(true);
+            request?.socket?.setKeepAlive(true, 15_000);
+        } catch (_) {
+        }
 
         console.log(
             "[WS] Cliente conectado"
         );
-
-        /*
-         * PTT em tempo real: evita que pequenos frames aguardem o algoritmo
-         * de Nagle. O ws normalmente já usa noDelay, mas deixamos explícito
-         * e habilitamos keep-alive TCP como proteção adicional de rede.
-         */
-        try {
-            ws._socket?.setNoDelay(true);
-            ws._socket?.setKeepAlive(true, 30_000);
-        } catch (_) {
-        }
-
-        ws.channelById = new Map();
-        ws.trustedChannelIds = new Set();
-        ws.receiveChannelIds = new Set();
-        ws.transmitChannelIds = new Set();
-        ws.audioBackpressurePeak = 0;
-        ws.audioBackpressureWarnings = 0;
 
         ws.isMasterAdminMonitor =
             false;
@@ -12982,11 +12801,11 @@ wss.on(
         ws.masterMonitorTxKey =
             null;
 
-        ws.masterMonitorTranscoder =
-            null;
+        ws.masterMonitorAudioRelayReason =
+            "connection";
 
-        ws.masterMonitorTranscoderError =
-            "";
+        ws.masterMonitorBackpressureLastLogAt =
+            0;
 
         ws.userId =
             null;
@@ -13048,6 +12867,18 @@ wss.on(
         ws.lastSeenAt =
             Date.now();
 
+        ws.audioBackpressureDrops =
+            0;
+
+        ws.audioBackpressureLastLogAt =
+            0;
+
+        ws.masterMonitorDroppedAmrFrames =
+            0;
+
+        ws.masterMonitorBackpressureLastLogAt =
+            0;
+
         ws.on(
             "pong",
             () => {
@@ -13062,7 +12893,7 @@ wss.on(
 
         ws.on(
             "message",
-            async (
+            (
                 data,
                 isBinary
             ) => {
@@ -13130,35 +12961,75 @@ wss.on(
                     }
 
                     let delivered = 0;
+                    let backpressured = 0;
 
                     for (const client of clients.values()) {
+                        /*
+                         * FAST PATH DO ÁUDIO
+                         *
+                         * rxChannelId só é atribuído depois das regras de
+                         * participação, bloqueio, canal privado e confiança
+                         * terem sido validadas. refreshConnectedClientChannels
+                         * remove a seleção imediatamente quando a permissão muda.
+                         * Portanto não repetimos buscas/Set a cada frame de 20 ms.
+                         */
                         if (
-                            canClientReceiveFromChannel(
-                                client,
-                                channelId
-                            ) &&
-                            client.rxChannelId === channelId &&
-                            !client.txChannelId &&
-                            client.userId !== ws.userId
+                            !isOpen(client) ||
+                            client.rxChannelId !== channelId ||
+                            client.txChannelId ||
+                            client.userId === ws.userId
                         ) {
-                            try {
-                                if (
-                                    sendRealtimeAudio(
-                                        client,
-                                        data
-                                    )
-                                ) {
-                                    delivered++;
-                                }
+                            continue;
+                        }
 
-                            } catch (error) {
-                                console.error(
-                                    `[AUDIO TX ERROR] ` +
+                        /*
+                         * Um receptor com rede ruim não pode acumular uma fila
+                         * enorme e aumentar memória/GC para todos. Em condições
+                         * normais bufferedAmount fica próximo de zero.
+                         */
+                        if (
+                            Number(client.bufferedAmount || 0) >
+                                MAX_AUDIO_BUFFERED_BYTES
+                        ) {
+                            client.audioBackpressureDrops =
+                                Number(client.audioBackpressureDrops || 0) + 1;
+                            backpressured++;
+
+                            const now = Date.now();
+                            if (
+                                now - Number(client.audioBackpressureLastLogAt || 0) >=
+                                    5_000
+                            ) {
+                                client.audioBackpressureLastLogAt = now;
+                                console.warn(
+                                    `[AUDIO BACKPRESSURE] ` +
+                                    `listener=${client.userId} ` +
                                     `channel=${channelId} ` +
-                                    `para=${client.userId} ` +
-                                    `${error.message}`
+                                    `buffered=${client.bufferedAmount} ` +
+                                    `drops=${client.audioBackpressureDrops}`
                                 );
                             }
+
+                            continue;
+                        }
+
+                        try {
+                            client.send(
+                                data,
+                                {
+                                    binary: true
+                                }
+                            );
+
+                            delivered++;
+
+                        } catch (error) {
+                            console.error(
+                                `[AUDIO TX ERROR] ` +
+                                `channel=${channelId} ` +
+                                `para=${client.userId} ` +
+                                `${error.message}`
+                            );
                         }
                     }
 
@@ -13197,10 +13068,13 @@ wss.on(
                     }
 
                     if (
-                        txState.audioPacketCount === 1 ||
-                        txState.audioPacketCount % 100 === 0
+                        AUDIO_PACKET_DEBUG &&
+                        (
+                            txState.audioPacketCount === 1 ||
+                            txState.audioPacketCount % 250 === 0
+                        )
                     ) {
-                        const opusSize =
+                        const codecPayloadSize =
                             data.length - AUDIO_HEADER_SIZE;
 
                         console.log(
@@ -13208,8 +13082,9 @@ wss.on(
                             `de=${ws.userId} ` +
                             `channel=${channelId} ` +
                             `bytes=${data.length} ` +
-                            `opus=${opusSize} ` +
-                            `destinatarios=${delivered}`
+                            `payload=${codecPayloadSize} ` +
+                            `destinatarios=${delivered} ` +
+                            `backpressure=${backpressured}`
                         );
                     }
 
@@ -13254,9 +13129,19 @@ wss.on(
                     return;
                 }
 
-                await handleJson(
-                    ws,
-                    message
+                Promise.resolve(
+                    handleJson(
+                        ws,
+                        message
+                    )
+                ).catch(
+                    error => {
+                        console.error(
+                            `[JSON HANDLE ERROR] ` +
+                            `${ws.userId || "não identificado"}: ` +
+                            `${error?.stack || error?.message || error}`
+                        );
+                    }
                 );
             }
         );
@@ -13282,7 +13167,7 @@ wss.on(
                 clearReceiveSelectionTimer(ws);
 
                 if (ws.isMasterAdminMonitor) {
-                    stopMasterMonitorTranscoder(
+                    resetMasterMonitorAudioRelay(
                         ws,
                         "websocket-close"
                     );
@@ -13531,10 +13416,23 @@ setInterval(
     () => {
         let packetCount = 0;
         let byteCount = 0;
+        let backpressureDrops = 0;
+        let maxBufferedAmount = 0;
 
         for (const state of activeTransmitters.values()) {
             packetCount += Number(state.audioPacketCount || 0);
             byteCount += Number(state.audioBytesRelayed || 0);
+        }
+
+        for (const client of clients.values()) {
+            backpressureDrops +=
+                Number(client.audioBackpressureDrops || 0);
+
+            maxBufferedAmount =
+                Math.max(
+                    maxBufferedAmount,
+                    Number(client.bufferedAmount || 0)
+                );
         }
 
         if (packetCount > 0) {
@@ -13542,7 +13440,9 @@ setInterval(
                 `[AUDIO STATS] ` +
                 `canaisAtivos=${activeTransmitters.size} ` +
                 `pacotes=${packetCount} ` +
-                `bytes=${byteCount}`
+                `bytes=${byteCount} ` +
+                `backpressureDrops=${backpressureDrops} ` +
+                `maxBuffered=${maxBufferedAmount}`
             );
         }
     },
